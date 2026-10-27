@@ -1,0 +1,6 @@
+{
+  "name": "Rise of the Raccoons!",
+  "description": "Vertical arcade climbing web game where an agile raccoon scales a 25-floor skyscraper with responsive keyboard and drag controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
