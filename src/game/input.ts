@@ -270,6 +270,10 @@ export class InputController {
     this.state.isSpeedBoosted = isBoosted;
   }
 
+  public isDownPressed(): boolean {
+    return this.state.keys.down || (this.state.joystick.active && this.state.joystick.y < -0.3);
+  }
+
   public hasActiveKeyboardMove(): boolean {
     return (
       this.state.keys.up ||

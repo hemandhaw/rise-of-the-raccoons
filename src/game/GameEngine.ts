@@ -4,7 +4,9 @@
  */
 
 import { sound } from './audio';
-import { GAME_CONFIG, getTrashCanStartX } from './config';
+import { getSavedCharacterId, saveSelectedCharacterId } from './characterConfig';
+import { getSavedLevelId, saveSelectedLevelId } from './levelConfig';
+import { GAME_CONFIG, getTrashCanStartX, getEnergySpeedRatio, getScaledSnackEnergy } from './config';
 import {
   EncounterDirector,
   EncounterDefinition,
@@ -30,6 +32,7 @@ import {
   VehicleType,
   WindowDecoration,
 } from './types';
+import { reportDailyMissionEvent, MissionEventType } from './dailyMissions';
 
 export class GameEngine {
   private canvas: HTMLCanvasElement;
@@ -72,6 +75,14 @@ export class GameEngine {
   private sillRestDuration: number = 0;
   private hasSpawnedRestSnack: boolean = false;
   private lastRestingSillKey: string = '';
+
+  // Cooldowns and special event triggers
+  private snackCollectionCooldown: number = 0;
+  private spookGlobalCooldown: number = 0;
+  private hasPlayedEagleScreech: boolean = false;
+  private roofCelebrationActive: boolean = false;
+  private roofCelebrationTimer: number = 0;
+  private hasTriggeredHalfwayMilestone: boolean = false;
 
   constructor(canvas: HTMLCanvasElement, onStateChange?: (state: GameEngineState) => void) {
     this.canvas = canvas;
@@ -135,6 +146,9 @@ export class GameEngine {
         isInTrashCan: true,
         climbOutOfCanTimer: 0,
         energy: GAME_CONFIG.ENERGY.MAX_ENERGY,
+        continuousClimbDuration: 0,
+        currentSpeedRatio: 1.0,
+        isSpeedBoosted: false,
         pawPositions: {
           frontLeft: { x: 0, y: 0 },
           frontRight: { x: 0, y: 0 },
@@ -189,12 +203,17 @@ export class GameEngine {
       activeToast: null,
       atmosphere: {
         squirrels: [],
+        bats: [],
         geeseFlocks: [],
         soaringBirds: [],
         balloons: [],
         lightning: null,
         mistClouds: [],
         lightningFlashAlpha: 0,
+        kite: this.initStreetKite(),
+        sillPigeons: this.initSillPigeons(),
+        superhero: null,
+        weather: this.initWeather(),
       },
       streetVehicles: [],
       laundryLine: {
@@ -210,6 +229,10 @@ export class GameEngine {
         fallingItems: [],
       },
       electricSparks: [],
+      navigationBarriers: this.initNavigationBarriers(),
+      celebrationFireworks: [],
+      celebrationTimer: 0,
+      interactionPrompt: null,
       currentFloor: 1,
       highestFloorReached: 1,
       bestFloor: this.bestFloor,
@@ -218,6 +241,9 @@ export class GameEngine {
       climbTimeSeconds: 0,
       totalFloors: GAME_CONFIG.SKYSCRAPER.TOTAL_FLOORS,
       isMuted: sound.isMuted(),
+      selectedCharacterId: getSavedCharacterId(),
+      selectedLevelId: getSavedLevelId(),
+      halfwayMilestoneTimer: 0,
     };
 
     // Seed initial snacks on lower window sills
@@ -229,7 +255,7 @@ export class GameEngine {
       onPause: () => this.togglePause(),
       onAction: () => {
         if (this.state.screen === 'MAIN_MENU') {
-          this.startGame();
+          this.openCharacterSelect();
         }
       },
     });
@@ -270,27 +296,339 @@ export class GameEngine {
     this.input.setJoystickVector(x, y, active, isBoosted);
   }
 
+  public setSpeedBoost(isBoosted: boolean) {
+    this.input.setSpeedBoost(isBoosted);
+  }
+
   /**
    * Seeds an initial climbing squirrel above the starting position with enough space to react & avoid
    */
   private seedInitialSquirrels() {
-    const startX = getTrashCanStartX();
-    const floor1Halfway = GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO * 0.5; // 0.26
+    const mullions = this.getBrickMullionLanes();
+    // Keep squirrels away from the window nearest the starting position (Floor 1 Window 5):
+    // Place initial squirrel on Column 1 (left side of building) climbing downward
+    const initialCol = 1;
+    const initialX = mullions[initialCol];
     this.state.atmosphere.squirrels = [
       {
         id: this.nextAtmosphereId++,
-        x: startX,
-        y: Math.max(0.36, floor1Halfway + 0.10), // Placed on brick wall well above floor 1 halfway point
-        targetY: 0.44,
-        vy: 0.06,
-        facing: 'up',
-        side: 'right',
+        x: initialX,
+        y: 0.95,
+        targetY: 0.65, // Actively climbing downward!
+        vx: 0,
+        vy: 0.08,
+        facing: 'down',
+        side: 'left',
+        state: 'climbing_wall',
+        currentColumn: initialCol,
         tailAngle: 0,
         climbPhase: 0,
-        pauseTimer: 0.5,
+        pauseTimer: 0.4,
         acorn: true,
       },
     ];
+  }
+
+  /**
+   * Initializes navigation barriers across the skyscraper ascent.
+   * Enforces rule: raccoon cannot climb straight upward more than 4 floors without encountering
+   * elements that force it to move left/right one or more window bays/columns.
+   * Floor 13 features a full-width traversal barrier forcing crossing to the far right.
+   * Barriers cause NO slipping or energy loss—they simply block direct vertical passage.
+   */
+  private initNavigationBarriers(): import('./types').NavigationBarrier[] {
+    const { FLOOR_HEIGHT_RATIO, WINDOW_WIDTH_RATIO, WINDOWS_PER_FLOOR, BUILDING_WIDTH_RATIO, BUILDING_CENTER_X } = GAME_CONFIG.SKYSCRAPER;
+    const bLeft = BUILDING_CENTER_X - BUILDING_WIDTH_RATIO / 2;
+    const bRight = BUILDING_CENTER_X + BUILDING_WIDTH_RATIO / 2;
+    const winW = WINDOW_WIDTH_RATIO;
+    const totalWinsW = WINDOWS_PER_FLOOR * winW;
+    const gap = (BUILDING_WIDTH_RATIO - totalWinsW) / (WINDOWS_PER_FLOOR + 1);
+
+    const getColSpan = (col: number) => {
+      if (col === 0) {
+        return { left: bLeft, right: bLeft + gap * 0.95 };
+      } else if (col === 6) {
+        const lastWinRight = bLeft + gap + 5 * (winW + gap) + winW;
+        return { left: lastWinRight + gap * 0.05, right: bRight };
+      } else {
+        const winIdx = col - 1;
+        const colLeft = bLeft + gap + winIdx * (winW + gap) + winW;
+        return { left: colLeft - 0.01, right: colLeft + gap + 0.01 };
+      }
+    };
+
+    const getColumnsSpan = (cols: number[]) => {
+      let minX = Infinity;
+      let maxX = -Infinity;
+      for (const c of cols) {
+        const s = getColSpan(c);
+        if (s.left < minX) minX = s.left;
+        if (s.right > maxX) maxX = s.right;
+      }
+      return { minX, maxX };
+    };
+
+    const barriers: import('./types').NavigationBarrier[] = [];
+
+    // Barrier 1 (Floor 3): Scaffolding with window cleaner (blocks cols 4, 5, 6)
+    const b1Cols = [4, 5, 6];
+    const b1Span = getColumnsSpan(b1Cols);
+    barriers.push({
+      id: 'barrier_scaffolding_f3',
+      floor: 3,
+      type: 'scaffolding',
+      blockedColumns: b1Cols,
+      worldY: 2 * FLOOR_HEIGHT_RATIO + 0.16,
+      height: 0.14,
+      leftX: b1Span.minX,
+      rightX: b1Span.maxX,
+      label: 'WINDOW WASHER',
+    });
+
+    // Barrier 2 (Floor 5): Drone Patrol (blocks cols 0, 1)
+    const b2Cols = [0, 1];
+    const b2Span = getColumnsSpan(b2Cols);
+    barriers.push({
+      id: 'barrier_drone_f5',
+      floor: 5,
+      type: 'drone',
+      blockedColumns: b2Cols,
+      worldY: 4 * FLOOR_HEIGHT_RATIO + 0.20,
+      height: 0.12,
+      leftX: b2Span.minX,
+      rightX: b2Span.maxX,
+      label: 'SECURITY DRONE',
+    });
+
+    // Barrier 3 (Floor 7): Banner "Never Give Up!" (blocks cols 2, 3, 4)
+    const b3Cols = [2, 3, 4];
+    const b3Span = getColumnsSpan(b3Cols);
+    barriers.push({
+      id: 'barrier_banner_never_give_up_f7',
+      floor: 7,
+      type: 'banner_never_give_up',
+      blockedColumns: b3Cols,
+      worldY: 6 * FLOOR_HEIGHT_RATIO + 0.22,
+      height: 0.13,
+      leftX: b3Span.minX,
+      rightX: b3Span.maxX,
+      label: 'NEVER GIVE UP!',
+    });
+
+    // Barrier 4 (Floor 10): Hovering Inspection Drone & Scaffolding (blocks cols 0, 1, 6)
+    const b4SpanL = getColumnsSpan([0, 1]);
+    const b4SpanR = getColSpan(6);
+    barriers.push({
+      id: 'barrier_drone_f10_left',
+      floor: 10,
+      type: 'drone',
+      blockedColumns: [0, 1],
+      worldY: 9 * FLOOR_HEIGHT_RATIO + 0.20,
+      height: 0.12,
+      leftX: b4SpanL.minX,
+      rightX: b4SpanL.maxX,
+      label: 'INSPECTION DRONE',
+    });
+    barriers.push({
+      id: 'barrier_scaffold_f10_right',
+      floor: 10,
+      type: 'scaffolding',
+      blockedColumns: [6],
+      worldY: 9 * FLOOR_HEIGHT_RATIO + 0.20,
+      height: 0.12,
+      leftX: b4SpanR.left,
+      rightX: b4SpanR.right,
+      label: 'MAINTENANCE',
+    });
+
+    // Barrier 5 (Floor 13): Full-Width Mandatory Traversal Barrier!
+    // Blocks columns 0, 1, 2, 3, 4, 5! Leaves ONLY Column 6 (far right) open!
+    // Forces any player climbing on the left or center to traverse all the way across.
+    const b5Cols = [0, 1, 2, 3, 4, 5];
+    const b5Span = getColumnsSpan(b5Cols);
+    barriers.push({
+      id: 'barrier_crossover_f13',
+      floor: 13,
+      type: 'full_width_mesh',
+      blockedColumns: b5Cols,
+      worldY: 12 * FLOOR_HEIGHT_RATIO + 0.15,
+      height: 0.16,
+      leftX: b5Span.minX,
+      rightX: b5Span.maxX,
+      label: 'CROSSOVER TO FAR RIGHT ➔',
+    });
+
+    // Barrier 6 (Floor 16): Suspended Maintenance Platform (blocks cols 4, 5, 6)
+    const b6Cols = [4, 5, 6];
+    const b6Span = getColumnsSpan(b6Cols);
+    barriers.push({
+      id: 'barrier_platform_f16',
+      floor: 16,
+      type: 'maintenance_platform',
+      blockedColumns: b6Cols,
+      worldY: 15 * FLOOR_HEIGHT_RATIO + 0.20,
+      height: 0.12,
+      leftX: b6Span.minX,
+      rightX: b6Span.maxX,
+      label: 'MAINTENANCE PLATFORM',
+    });
+
+    // Barrier 7 (Floor 17): Eagle Nest (blocks cols 1, 2, 3)
+    const b7Cols = [1, 2, 3];
+    const b7Span = getColumnsSpan(b7Cols);
+    barriers.push({
+      id: 'barrier_eagle_nest_f17',
+      floor: 17,
+      type: 'eagle_nest',
+      blockedColumns: b7Cols,
+      worldY: 16 * FLOOR_HEIGHT_RATIO + 0.18,
+      height: 0.14,
+      leftX: b7Span.minX,
+      rightX: b7Span.maxX,
+      label: 'EAGLE NEST 🦅',
+    });
+
+    // Barrier 8 (Floor 20): Banner "You can do it!" (blocks cols 3, 4, 5, 6)
+    const b8Cols = [3, 4, 5, 6];
+    const b8Span = getColumnsSpan(b8Cols);
+    barriers.push({
+      id: 'barrier_banner_you_can_do_it_f20',
+      floor: 20,
+      type: 'banner_you_can_do_it',
+      blockedColumns: b8Cols,
+      worldY: 19 * FLOOR_HEIGHT_RATIO + 0.22,
+      height: 0.13,
+      leftX: b8Span.minX,
+      rightX: b8Span.maxX,
+      label: 'YOU CAN DO IT!',
+    });
+
+    // Barrier 9 (Floor 23): High-Rise Drone Fleet (blocks cols 0, 1, 2)
+    const b9Cols = [0, 1, 2];
+    const b9Span = getColumnsSpan(b9Cols);
+    barriers.push({
+      id: 'barrier_drone_f23',
+      floor: 23,
+      type: 'drone',
+      blockedColumns: b9Cols,
+      worldY: 22 * FLOOR_HEIGHT_RATIO + 0.20,
+      height: 0.12,
+      leftX: b9Span.minX,
+      rightX: b9Span.maxX,
+      label: 'SURVEILLANCE DRONE',
+    });
+
+    return barriers;
+  }
+
+  private initStreetKite(): import('./types').StreetKite {
+    const { STREET_KITE } = GAME_CONFIG.INTERACTIVE_ELEMENTS;
+    const initialTargetY = STREET_KITE.MIN_WORLD_Y + 0.35;
+    return {
+      childX: STREET_KITE.CHILD_X,
+      childY: STREET_KITE.CHILD_Y,
+      kiteX: STREET_KITE.KITE_BASE_X,
+      kiteY: STREET_KITE.MIN_WORLD_Y, // Begins at second floor
+      targetY: initialTargetY,
+      speedY: 0.045,
+      targetTimer: 3.5,
+      swayPhase: 0,
+    };
+  }
+
+  private initSillPigeons(): import('./types').SillPigeonsGroup {
+    const pigeons: import('./types').NappingPigeon[] = [];
+    for (let i = 0; i < 12; i++) {
+      pigeons.push({
+        id: i,
+        offsetRatio: 0.08 + (i / 11) * 0.84,
+        facing: (i % 2 === 0 ? 1 : -1) as (1 | -1),
+        state: 'napping',
+        flyX: 0,
+        flyY: 0,
+        flyVx: 0,
+        flyVy: 0,
+        wingPhase: (i * 0.55) % (Math.PI * 2),
+      });
+    }
+    return {
+      floorNumber: 2,
+      windowIndex: 2,
+      isScattered: false,
+      scatterTimer: 0,
+      pigeons,
+    };
+  }
+
+  private initWeather(): import('./types').WeatherState {
+    return {
+      type: 'clear',
+      intensity: 1.0,
+      targetType: 'clear',
+      transitionTimer: 0,
+      drops: [],
+      splashes: [],
+      wind: 0.15,
+      groundWetness: 0,
+      frostLevel: 0,
+      mode: 'auto',
+    };
+  }
+
+  private initCelebrationFireworks() {
+    this.state.celebrationFireworks = [];
+    this.state.celebrationTimer = 0;
+    const colors = ['#f43f5e', '#38bdf8', '#facc15', '#4ade80', '#c084fc', '#fb923c', '#ffffff'];
+    for (let i = 0; i < 45; i++) {
+      const angle = (Math.PI * 2 * i) / 45 + (Math.random() - 0.5) * 0.3;
+      const speed = 0.08 + Math.random() * 0.22;
+      this.state.celebrationFireworks.push({
+        id: i + 1,
+        x: this.state.raccoon.x,
+        y: this.state.raccoon.y + 0.08,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        color: colors[i % colors.length],
+        size: 3 + Math.random() * 4,
+        alpha: 1.0,
+        age: 0,
+        maxAge: 2.2 + Math.random() * 1.5,
+      });
+    }
+  }
+
+  private updateCelebrationFireworks(dt: number) {
+    if (!this.state.celebrationFireworks || this.state.celebrationFireworks.length === 0) return;
+    this.state.celebrationTimer = (this.state.celebrationTimer || 0) + dt;
+    for (const fw of this.state.celebrationFireworks) {
+      fw.age += dt;
+      fw.x += fw.vx * dt;
+      fw.y += fw.vy * dt;
+      fw.vy -= 0.06 * dt;
+      fw.alpha = Math.max(0, 1.0 - fw.age / fw.maxAge);
+    }
+    if (Math.random() < 0.12 && this.state.celebrationFireworks.length < 80) {
+      const colors = ['#f43f5e', '#38bdf8', '#facc15', '#4ade80', '#c084fc', '#fb923c', '#ffffff'];
+      const burstX = this.state.raccoon.x + (Math.random() - 0.5) * 0.35;
+      const burstY = this.state.raccoon.y + 0.05 + Math.random() * 0.18;
+      for (let j = 0; j < 18; j++) {
+        const ang = Math.random() * Math.PI * 2;
+        const spd = 0.06 + Math.random() * 0.18;
+        this.state.celebrationFireworks.push({
+          id: Math.floor(Math.random() * 100000),
+          x: burstX,
+          y: burstY,
+          vx: Math.cos(ang) * spd,
+          vy: Math.sin(ang) * spd,
+          color: colors[Math.floor(Math.random() * colors.length)],
+          size: 2.5 + Math.random() * 3.5,
+          alpha: 1.0,
+          age: 0,
+          maxAge: 1.8 + Math.random() * 1.2,
+        });
+      }
+    }
+    this.state.celebrationFireworks = this.state.celebrationFireworks.filter((f) => f.age < f.maxAge);
   }
 
   /**
@@ -373,6 +711,41 @@ export class GameEngine {
 
     this.state.camera.targetY = Math.max(0.12, this.state.raccoon.y);
     this.triggerTrashPop(canX, canTop, dirX);
+    this.checkDailyMissionEvent('trash_pop', 1);
+  }
+
+  public openCharacterSelect() {
+    sound.playMenuClick();
+    this.state.screen = 'CHARACTER_SELECT';
+    this.notifyState();
+  }
+
+  public openLevelSelect() {
+    sound.playMenuClick();
+    this.state.screen = 'LEVEL_SELECT';
+    this.notifyState();
+  }
+
+  public selectCharacter(characterId: string) {
+    this.state.selectedCharacterId = characterId;
+    saveSelectedCharacterId(characterId);
+    this.notifyState();
+  }
+
+  public selectLevel(levelId: string) {
+    this.state.selectedLevelId = levelId;
+    saveSelectedLevelId(levelId);
+    this.notifyState();
+  }
+
+  public startGameWithCharacter(characterId: string) {
+    this.selectCharacter(characterId);
+    this.startGame();
+  }
+
+  public startGameWithLevel(levelId: string) {
+    this.selectLevel(levelId);
+    this.startGame();
   }
 
   public startGame() {
@@ -392,8 +765,22 @@ export class GameEngine {
     this.state.raccoon.restingSillFloor = null;
     this.state.raccoon.restingSillWindowIndex = null;
     this.state.raccoon.facing = 'up';
+    this.state.raccoon.isSpeedBoosted = false;
+    this.state.raccoon.boostActiveTimer = 0;
+    this.state.raccoon.boostCooldownTimer = 0;
+    this.state.raccoon.continuousClimbDuration = 0;
+    this.state.raccoon.currentSpeedRatio = 1.0;
     this.state.camera.targetX = this.state.trashCan.x;
     this.state.camera.targetY = 0.08;
+    this.state.interactionPrompt = null;
+    this.state.celebrationFireworks = [];
+    this.state.celebrationTimer = 0;
+    this.roofCelebrationActive = false;
+    this.roofCelebrationTimer = 0;
+    this.state.navigationBarriers = this.initNavigationBarriers();
+    this.snackCollectionCooldown = 0;
+    this.spookGlobalCooldown = 0;
+    this.hasPlayedEagleScreech = false;
     this.seedInitialSquirrels();
     this.notifyState();
   }
@@ -401,6 +788,8 @@ export class GameEngine {
   public resetGame() {
     sound.playGameStart();
     this.encounterDirector.reset();
+    this.roofCelebrationActive = false;
+    this.roofCelebrationTimer = 0;
     const trashCanY = GAME_CONFIG.TRASH_CAN.GROUND_Y;
     const trashCanStartX = getTrashCanStartX();
     this.state.screen = 'PLAYING';
@@ -424,6 +813,11 @@ export class GameEngine {
     this.state.raccoon.containerType = 'right_can';
     this.state.raccoon.climbOutOfCanTimer = 0;
     this.state.raccoon.energy = 100;
+    this.state.raccoon.isSpeedBoosted = false;
+    this.state.raccoon.boostActiveTimer = 0;
+    this.state.raccoon.boostCooldownTimer = 0;
+    this.state.raccoon.continuousClimbDuration = 0;
+    this.state.raccoon.currentSpeedRatio = 1.0;
     this.state.trashCan.lidAngle = 0.35;
     this.state.trashCan.lidRattleTimer = 0;
     const { BUILDING_CENTER_X, BUILDING_WIDTH_RATIO } = GAME_CONFIG.SKYSCRAPER;
@@ -474,12 +868,17 @@ export class GameEngine {
     this.state.activeToast = null;
     this.state.atmosphere = {
       squirrels: [],
+      bats: [],
       geeseFlocks: [],
       soaringBirds: [],
       balloons: [],
       lightning: null,
       mistClouds: [],
       lightningFlashAlpha: 0,
+      kite: this.initStreetKite(),
+      sillPigeons: this.initSillPigeons(),
+      superhero: null,
+      weather: this.initWeather(),
     };
     this.state.streetVehicles = [];
     this.state.laundryLine = {
@@ -495,6 +894,15 @@ export class GameEngine {
       fallingItems: [],
     };
     this.state.electricSparks = [];
+    this.state.navigationBarriers = this.initNavigationBarriers();
+    this.state.celebrationFireworks = [];
+    this.state.celebrationTimer = 0;
+    this.state.halfwayMilestoneTimer = 0;
+    this.hasTriggeredHalfwayMilestone = false;
+    this.state.interactionPrompt = null;
+    this.snackCollectionCooldown = 0;
+    this.spookGlobalCooldown = 0;
+    this.hasPlayedEagleScreech = false;
     this.atmosphereSpawnTimer = 0.5;
     this.nextLightningTimer = 10.0;
     this.snackSpawnTimer = 0.8;
@@ -695,6 +1103,8 @@ export class GameEngine {
 
   public returnToMainMenu() {
     sound.playMenuClick();
+    this.roofCelebrationActive = false;
+    this.roofCelebrationTimer = 0;
     this.state.screen = 'MAIN_MENU';
     this.state.raccoon.isInTrashCan = true;
     this.state.raccoon.x = this.state.trashCan.x;
@@ -730,7 +1140,7 @@ export class GameEngine {
     this.input.update(dt);
 
     // Run simulation
-    if (this.state.screen === 'PLAYING' || this.state.screen === 'MAIN_MENU') {
+    if (this.state.screen === 'PLAYING' || this.state.screen === 'MAIN_MENU' || this.state.screen === 'CHARACTER_SELECT') {
       this.updateSimulation(dt, currentTimeMs / 1000);
     }
 
@@ -751,10 +1161,12 @@ export class GameEngine {
     const maxX = SKYSCRAPER.BUILDING_CENTER_X + bWidth / 2 - RACCOON.HORIZONTAL_MARGIN;
 
     // Skyscraper vertical bounds:
-    // Allow raccoon to crawl on the ground (sidewalk level) bounded by the side trash cans
+    // Allow raccoon to crawl on the ground (sidewalk level) bounded by the side trash cans,
+    // and climb all the way to the top of the building (Floor 25 rooftop ledge)
     const groundSurfaceY = GAME_CONFIG.TRASH_CAN.GROUND_Y;
     const minY = groundSurfaceY;
-    const maxY = (SKYSCRAPER.TOTAL_FLOORS - 1) * SKYSCRAPER.FLOOR_HEIGHT_RATIO + 0.48;
+    const roofSillY = SKYSCRAPER.TOTAL_FLOORS * SKYSCRAPER.FLOOR_HEIGHT_RATIO;
+    const maxY = roofSillY + 0.04;
 
     // Update trash particles physics
     const gravity = GAME_CONFIG.TRASH_CAN.GRAVITY;
@@ -810,7 +1222,7 @@ export class GameEngine {
       this.state.dumpster.lidRattleTimer -= dt;
     }
 
-    if (this.state.screen === 'MAIN_MENU') {
+    if (this.state.screen === 'MAIN_MENU' || this.state.screen === 'CHARACTER_SELECT') {
       // Gentle atmospheric idle animation for raccoon peeking from trash can at base on right side of building
       this.state.raccoon.x = this.state.trashCan.x;
       this.state.raccoon.y = GAME_CONFIG.TRASH_CAN.GROUND_Y + 0.015 + Math.sin(timeSeconds * 1.5) * 0.003;
@@ -826,6 +1238,9 @@ export class GameEngine {
 
     this.state.climbTimeSeconds += dt;
     this.state.raccoon.slipEffectTimer = Math.max(0, this.state.raccoon.slipEffectTimer - dt);
+    if (this.state.halfwayMilestoneTimer && this.state.halfwayMilestoneTimer > 0) {
+      this.state.halfwayMilestoneTimer = Math.max(0, this.state.halfwayMilestoneTimer - dt);
+    }
     if (this.state.raccoon.climbOutOfCanTimer > 0) {
       this.state.raccoon.climbOutOfCanTimer -= dt;
     }
@@ -847,6 +1262,13 @@ export class GameEngine {
       this.state.raccoon.vx = 0;
       this.state.raccoon.y -= fallSpeed * dt;
 
+      if (this.state.raccoon.isFallingToTrashCan) {
+        const { BUILDING_CENTER_X, BUILDING_WIDTH_RATIO } = GAME_CONFIG.SKYSCRAPER;
+        const bLeft = BUILDING_CENTER_X - BUILDING_WIDTH_RATIO / 2;
+        const canX = this.state.leftTrashCan?.x ?? (bLeft + GAME_CONFIG.TRASH_CAN.LEFT_CAN_OFFSET);
+        this.state.raccoon.x += (canX - this.state.raccoon.x) * dt * 5.0;
+      }
+
       // Camera follows raccoon smoothly without infinite shaking
       this.state.camera.shake = Math.min(this.state.camera.shake, 0.15);
       this.state.camera.targetY = Math.max(0.12, this.state.raccoon.y);
@@ -859,9 +1281,25 @@ export class GameEngine {
         this.state.raccoon.vy = 0;
         this.state.raccoon.squashFactor = 1.25;
 
-        // If raccoon tumbled down to the ground (e.g. from floor 1 spook):
-        // Safely land on the ground below and immediately continue playing!
-        if (targetY <= groundSurfaceY + 0.02) {
+        // If raccoon was shocked and falling into the trashcan:
+        if (this.state.raccoon.isFallingToTrashCan) {
+          const { BUILDING_CENTER_X, BUILDING_WIDTH_RATIO } = GAME_CONFIG.SKYSCRAPER;
+          const bLeft = BUILDING_CENTER_X - BUILDING_WIDTH_RATIO / 2;
+          const canX = this.state.leftTrashCan?.x ?? (bLeft + GAME_CONFIG.TRASH_CAN.LEFT_CAN_OFFSET);
+          this.state.raccoon.x = canX;
+          this.state.raccoon.y = groundSurfaceY + 0.015;
+          this.state.raccoon.isFallingToTrashCan = false;
+          this.state.raccoon.isInTrashCan = true;
+          this.state.raccoon.containerType = 'left_can';
+          this.state.raccoon.isRestingOnSill = false;
+          this.state.raccoon.isClimbing = false;
+          this.state.raccoon.facing = 'up';
+          sound.playLidRattle?.();
+          this.spawnTrashParticles(canX, groundSurfaceY + 0.08);
+          this.spawnFloatingText('LANDED IN TRASH CAN! 🗑️⚡', canX, groundSurfaceY + 0.12, '#38bdf8');
+        } else if (targetY <= groundSurfaceY + 0.02) {
+          // If raccoon tumbled down to the ground (e.g. from floor 1 spook):
+          // Safely land on the ground below and immediately continue playing!
           this.state.raccoon.y = groundSurfaceY;
           this.state.raccoon.isRestingOnSill = true;
           this.state.raccoon.restingSillFloor = 1;
@@ -883,37 +1321,93 @@ export class GameEngine {
       return;
     }
 
-    // Universal Input Handling with Smooth Priority:
-    // Speed boost requires user input (two fingers / Shift / Space) and available energy
+    // Energy-Dependent Climbing Speed & Re-enabled Speed Burst System:
+    // 1. Climbing speed is determined by energy level brackets:
+    //    >=90%: 100%, 80-89%: 90%, 70-79%: 80%, 60-69%: 70%, 50-59%: 60%, 40-49%: 50%, 30-39%: 40%, 20-29%: 30%, 0-19%: 20%
+    // 2. Speed Burst:
+    //    - Allowed up to Floor 17
+    //    - Duration: 2.0s per burst
+    //    - Cooldown: 4.0s before next burst
+    //    - Boost multiplier: 1.65 (65% speed boost)
+    const currentFloor = this.state.currentFloor;
+    const burstConfig = RACCOON.SPEED_BURST;
+    const isBurstAllowedOnFloor = currentFloor <= burstConfig.MAX_FLOOR;
+
+    // Tick down burst cooldown timer
+    if (this.state.raccoon.boostCooldownTimer && this.state.raccoon.boostCooldownTimer > 0) {
+      this.state.raccoon.boostCooldownTimer = Math.max(0, this.state.raccoon.boostCooldownTimer - dt);
+    }
+
     const wantsBoost = Boolean(
       inputState.isSpeedBoosted ||
-      inputState.keys.space ||
       inputState.keys.shift ||
+      inputState.keys.space ||
       inputState.joystick.isBoosted
     );
 
-    const isBoosted = wantsBoost && (this.state.raccoon.energy > 0);
+    let isBoosted = false;
+
+    if (
+      wantsBoost &&
+      isBurstAllowedOnFloor &&
+      (!this.state.raccoon.boostCooldownTimer || this.state.raccoon.boostCooldownTimer <= 0) &&
+      this.state.raccoon.energy > 0 &&
+      !this.state.raccoon.isTumbling &&
+      !this.state.raccoon.isInTrashCan
+    ) {
+      if (!this.state.raccoon.isSpeedBoosted) {
+        this.state.raccoon.isSpeedBoosted = true;
+        this.state.raccoon.boostActiveTimer = burstConfig.MAX_DURATION;
+        sound.playSpeedBoost?.();
+        this.spawnFloatingText('⚡ SPEED BURST! ⚡', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#facc15');
+        this.checkDailyMissionEvent('burst_used', 1);
+      }
+
+      this.state.raccoon.boostActiveTimer = Math.max(0, (this.state.raccoon.boostActiveTimer ?? burstConfig.MAX_DURATION) - dt);
+
+      if (this.state.raccoon.boostActiveTimer <= 0) {
+        this.state.raccoon.isSpeedBoosted = false;
+        this.state.raccoon.boostActiveTimer = 0;
+        this.state.raccoon.boostCooldownTimer = burstConfig.COOLDOWN;
+        isBoosted = false;
+      } else {
+        isBoosted = true;
+      }
+    } else {
+      if (this.state.raccoon.isSpeedBoosted) {
+        this.state.raccoon.isSpeedBoosted = false;
+        this.state.raccoon.boostActiveTimer = 0;
+        this.state.raccoon.boostCooldownTimer = burstConfig.COOLDOWN;
+      }
+      isBoosted = false;
+    }
+
     this.state.raccoon.isSpeedBoosted = isBoosted;
-    const boostMult = isBoosted ? (RACCOON.BOOST_SPEED_MULTIPLIER || 1.65) : 1.0;
 
-    // Adjusted Floor-Based Speed Rates:
-    // Floors 1–5: 1.00 (100%), Floors 6–10: 0.90 (90%), Floors 11–15: 0.80 (80%),
-    // Floors 16–20: 0.70 (70%), Floors 21–Roof: 0.50 (50%)
-    const floorSpeedMult = this.getFloorSpeedMultiplier(this.state.currentFloor);
+    const energy = Math.max(0, Math.min(100, this.state.raccoon.energy));
+    const energySpeedRatio = getEnergySpeedRatio(energy);
+    const boostMultiplier = isBoosted ? (RACCOON.BOOST_MULTIPLIER || 1.50) : 1.00;
 
-    // Natural ivy ladder speed boost (moves slightly faster in creeping ivy without losing extra energy)
-    const ivyMult = this.state.raccoon.isOnIvy ? (GAME_CONFIG.ENERGY.IVY_SPEED_MULTIPLIER || 1.25) : 1.0;
+    // Weather impact on climbing speed and grip:
+    const weather = this.state.atmosphere?.weather;
+    let weatherSpeedMultiplier = 1.00;
+    if (weather) {
+      if (weather.type === 'rain') {
+        weatherSpeedMultiplier = GAME_CONFIG.WEATHER.RAIN_SPEED_MULTIPLIER; // 0.92 (-8%)
+      } else if (weather.type === 'snow') {
+        weatherSpeedMultiplier = GAME_CONFIG.WEATHER.SNOW_SPEED_MULTIPLIER; // 0.88 (-12%)
+      }
+    }
 
-    // Exhaustion penalty if energy is completely depleted
-    const exhaustMult = this.state.raccoon.energy <= 0 ? (GAME_CONFIG.ENERGY.EXHAUSTION_SPEED_MULTIPLIER || 0.65) : 1.0;
+    const baseClimbSpeed = RACCOON.BASE_CLIMB_SPEED || 0.20;
+    const currentClimbSpeed = baseClimbSpeed * energySpeedRatio * boostMultiplier * weatherSpeedMultiplier;
+    const climbSpeedUp = currentClimbSpeed;
+    const climbSpeedDown = currentClimbSpeed;
+    const moveSpeedX = currentClimbSpeed;
+    const diagSpeed = currentClimbSpeed;
+    const sillWalkSpeed = (RACCOON.SILL_WALK_SPEED || 0.22) * energySpeedRatio * (isBoosted ? 1.25 : 1.00) * (weather?.type === 'snow' ? 0.95 : 1.00);
 
-    const netSpeedMult = boostMult * floorSpeedMult * ivyMult * exhaustMult;
-
-    const climbSpeedUp = RACCOON.CLIMB_SPEED_UP * netSpeedMult;
-    const climbSpeedDown = RACCOON.CLIMB_SPEED_DOWN * netSpeedMult;
-    const moveSpeedX = RACCOON.MOVE_SPEED_X * netSpeedMult;
-    const sillWalkSpeed = RACCOON.SILL_WALK_SPEED * netSpeedMult;
-    const diagSpeed = RACCOON.CLIMB_SPEED_DIAGONAL * netSpeedMult;
+    this.state.raccoon.currentSpeedRatio = energySpeedRatio * boostMultiplier * weatherSpeedMultiplier;
 
     // 2. Universal Input Handling with Smooth Priority:
     // If keyboard is actively used or recently pressed, prioritize keyboard smoothly
@@ -925,7 +1419,7 @@ export class GameEngine {
 
     let targetVx = 0;
     let targetVy = 0;
-    let isScrambling = isBoosted;
+    let isScrambling = (this.state.raccoon.currentSpeedRatio ?? 1.0) > 0.85;
 
     // Check if player wants to descend/leave sill
     const wantsDown =
@@ -1277,10 +1771,27 @@ export class GameEngine {
       this.state.raccoon.vy = targetVy;
     }
 
-    // 0. DIAGONAL SLIDE DESCENT (Floor 7 Window 1 to Floor 4 Window 4)
+    // 0a. Smooth Game Over Fall before hitting ground
+    if (this.state.raccoon.isFallingToGameOver) {
+      this.state.raccoon.y -= 0.45 * dt;
+      this.state.raccoon.gameOverFadeAlpha = Math.min(1.0, (this.state.raccoon.gameOverFadeAlpha || 0) + dt * 0.95);
+      if (this.state.raccoon.y <= 0.08 || (this.state.raccoon.gameOverFadeAlpha || 0) >= 0.98) {
+        this.state.raccoon.isFallingToGameOver = false;
+        this.state.raccoon.isInTrashCan = true;
+        this.state.raccoon.y = groundSurfaceY + 0.015;
+        this.state.raccoon.x = this.state.trashCan.x;
+        this.state.screen = 'GAME_OVER';
+        sound.playGameOver();
+        this.notifyState();
+        return;
+      }
+      return;
+    }
+
+    // 0b. DIAGONAL SLIDE DESCENT (Floor 7 Window 1 to Floor 6 Window 3)
     if (this.state.raccoon.isSlidingDown) {
       this.state.raccoon.slideTimer = (this.state.raccoon.slideTimer || 0) + dt;
-      const duration = this.state.raccoon.slideDuration || 0.95;
+      const duration = this.state.raccoon.slideDuration || 0.65;
       const progress = Math.min(1.0, this.state.raccoon.slideTimer / duration);
       const startX = this.state.raccoon.slideStartX ?? this.state.raccoon.x;
       const startY = this.state.raccoon.slideStartY ?? this.state.raccoon.y;
@@ -1301,18 +1812,81 @@ export class GameEngine {
         this.state.raccoon.vx = 0;
         this.state.raccoon.vy = 0;
         this.state.raccoon.isRestingOnSill = true;
-        this.state.raccoon.restingSillFloor = 4;
-        this.state.raccoon.restingSillWindowIndex = 4;
+        this.state.raccoon.restingSillFloor = 6;
+        this.state.raccoon.restingSillWindowIndex = 3;
         sound.playSillLand();
         this.spawnFloatingText('SLIDE TOUCHDOWN! 🛝✨', targetX, targetY + 0.04, '#10b981');
+      }
+      // Keep camera tightly centered on raccoon during slide transition
+      this.state.camera.targetX = this.state.raccoon.x;
+      this.state.camera.targetY = this.state.raccoon.y;
+      this.state.camera.x += (this.state.raccoon.x - this.state.camera.x) * dt * 9.0;
+      this.state.camera.y += (this.state.raccoon.y - this.state.camera.y) * dt * 9.0;
+      this.updateFloorAndAltitude(timeSeconds);
+      return;
+    }
+
+    // 0c. STAR TREK TELEPORT (Floor 12 Win 3 <-> Floor 16 Win 3)
+    if (this.state.raccoon.isTeleporting) {
+      this.state.raccoon.teleportTimer = (this.state.raccoon.teleportTimer || 0) + dt;
+      const duration = this.state.raccoon.teleportDuration || 0.85;
+      const progress = Math.min(1.0, this.state.raccoon.teleportTimer / duration);
+      this.state.raccoon.vx = 0;
+      this.state.raccoon.vy = 0;
+
+      if (progress >= 1.0) {
+        this.state.raccoon.isTeleporting = false;
+        this.state.raccoon.x = this.state.raccoon.teleportTargetX!;
+        this.state.raccoon.y = this.state.raccoon.teleportTargetY!;
+        this.state.raccoon.isRestingOnSill = true;
+        this.state.raccoon.restingSillFloor = this.state.raccoon.teleportTargetFloor!;
+        this.state.raccoon.restingSillWindowIndex = this.state.raccoon.teleportTargetWin!;
+        sound.playSillLand();
+        this.spawnFloatingText(`BEAMED TO FLOOR ${this.state.raccoon.restingSillFloor}! 🖖✨`, this.state.raccoon.x, this.state.raccoon.y + 0.05, '#38bdf8');
       }
       return;
     }
 
-    // Check creeping ivy vines (Natural ladders: 1.25x speed boost without extra energy drain)
-    let onIvy = false;
+    // 0d. SWINGING TARZAN VINE (Floor 8: Win 0 <-> Win 4)
+    if (this.state.raccoon.isSwingingVine) {
+      this.state.raccoon.vineSwingTimer = (this.state.raccoon.vineSwingTimer || 0) + dt;
+      const duration = this.state.raccoon.vineSwingDuration || 1.15;
+      const progress = Math.min(1.0, this.state.raccoon.vineSwingTimer / duration);
+      const startX = this.state.raccoon.vineStartX ?? this.state.raccoon.x;
+      const targetX = this.state.raccoon.vineTargetX ?? this.state.raccoon.x;
+      const startY = this.state.raccoon.vineStartY ?? this.state.raccoon.y;
+      const targetY = this.state.raccoon.vineTargetY ?? this.state.raccoon.y;
+
+      const currentX = startX + (targetX - startX) * progress;
+      const sag = 0.08 * Math.sin(progress * Math.PI);
+      const currentY = startY + (targetY - startY) * progress - sag;
+
+      this.state.raccoon.x = currentX;
+      this.state.raccoon.y = currentY;
+      this.state.raccoon.facing = targetX >= startX ? 'right' : 'left';
+      this.state.raccoon.lastSideFacing = this.state.raccoon.facing;
+
+      if (progress >= 1.0) {
+        this.state.raccoon.isSwingingVine = false;
+        this.state.raccoon.x = targetX;
+        this.state.raccoon.y = targetY;
+        this.state.raccoon.isRestingOnSill = true;
+        this.state.raccoon.restingSillFloor = 8;
+        this.state.raccoon.restingSillWindowIndex = targetX > startX ? 4 : 0;
+        sound.playSillLand();
+        this.spawnFloatingText('TARZAN LANDING! 🌿✨', targetX, targetY + 0.05, '#22c55e');
+      }
+      // Keep camera tightly centered on raccoon during vine swing transition
+      this.state.camera.targetX = this.state.raccoon.x;
+      this.state.camera.targetY = this.state.raccoon.y;
+      this.state.camera.x += (this.state.raccoon.x - this.state.camera.x) * dt * 9.0;
+      this.state.camera.y += (this.state.raccoon.y - this.state.camera.y) * dt * 9.0;
+      this.updateFloorAndAltitude(timeSeconds);
+      return;
+    }
+
     const { BUILDING_CENTER_X, BUILDING_WIDTH_RATIO } = GAME_CONFIG.SKYSCRAPER;
-    const { IVY_VINES, FIRE_ESCAPE, LOBBY_DOUBLE_DOORS, ELECTRIC_CABLES, CELL_TOWER_BTS, LAUNDRY_LINE, SLIDE_7_TO_4 } = GAME_CONFIG.INTERACTIVE_ELEMENTS;
+    const { LOBBY_DOUBLE_DOORS, ELECTRIC_CABLES, CELL_TOWER_BTS, LAUNDRY_LINE, SLIDE_7_TO_4, TELEPORT, TARZAN_VINE } = GAME_CONFIG.INTERACTIVE_ELEMENTS;
     const bLeft = BUILDING_CENTER_X - BUILDING_WIDTH_RATIO / 2;
     const bRight = BUILDING_CENTER_X + BUILDING_WIDTH_RATIO / 2;
     const winW = GAME_CONFIG.SKYSCRAPER.WINDOW_WIDTH_RATIO;
@@ -1320,78 +1894,161 @@ export class GameEngine {
     const totalWinW = nWins * winW;
     const gap = (BUILDING_WIDTH_RATIO - totalWinW) / (nWins + 1);
 
-    for (const vine of IVY_VINES) {
-      const vStartY = (vine.startFloor - 1) * SKYSCRAPER.FLOOR_HEIGHT_RATIO;
-      const vEndY = vine.endFloor * SKYSCRAPER.FLOOR_HEIGHT_RATIO;
-      const vineCenterX = vine.winGapIndex === 0
-        ? bLeft + gap * 0.55
-        : bLeft + gap + (winW + gap) * vine.winGapIndex + gap * 0.45;
-      if (
-        this.state.raccoon.y >= vStartY &&
-        this.state.raccoon.y <= vEndY &&
-        Math.abs(this.state.raccoon.x - vineCenterX) <= vine.width * 0.65
-      ) {
-        onIvy = true;
-        break;
-      }
-    }
-    this.state.raccoon.isOnIvy = onIvy;
-    if (onIvy) {
-      targetVx *= GAME_CONFIG.ENERGY.IVY_SPEED_MULTIPLIER;
-      targetVy *= GAME_CONFIG.ENERGY.IVY_SPEED_MULTIPLIER;
-      this.state.raccoon.vx *= GAME_CONFIG.ENERGY.IVY_SPEED_MULTIPLIER;
-      this.state.raccoon.vy *= GAME_CONFIG.ENERGY.IVY_SPEED_MULTIPLIER;
-    }
+    // Active Shortcut Interaction Triggers (Only activated by pressing "down" while on related sill)
+    let hasPrompt = false;
 
-    // Check climbable fire escape ladder (Floors 3 through 18 - 0% energy drain!)
-    let onFireEscape = false;
-    const feMinY = (FIRE_ESCAPE.FLOORS[0] - 1) * SKYSCRAPER.FLOOR_HEIGHT_RATIO;
-    const feMaxY = (FIRE_ESCAPE.FLOORS[FIRE_ESCAPE.FLOORS.length - 1]) * SKYSCRAPER.FLOOR_HEIGHT_RATIO + 0.12;
-    const feLadderX = bRight - gap * 0.60;
-    if (
-      this.state.raccoon.y >= feMinY &&
-      this.state.raccoon.y <= feMaxY &&
-      Math.abs(this.state.raccoon.x - feLadderX) <= FIRE_ESCAPE.LADDER_WIDTH * 0.85
-    ) {
-      onFireEscape = true;
-    }
-    this.state.raccoon.isOnFireEscape = onFireEscape;
-
-    // Check Diagonal Slide Trigger (Floor 7 Window 1 to Floor 6 Window 3)
+    // 1. Diagonal Slide Trigger (Floor 7 Window 1 to Floor 6 Window 3)
     const floor7 = this.floors.find((f) => f.floorNumber === 7);
     const floor6 = this.floors.find((f) => f.floorNumber === 6);
     if (floor7 && floor6 && floor7.windows[1] && floor6.windows[3]) {
       const slideStartWin = floor7.windows[1];
       const slideEndWin = floor6.windows[3];
-      const slideStartX = slideStartWin.worldRight - 0.015;
-      const slideStartY = slideStartWin.sillY + 0.012;
-      const slideTargetX = slideEndWin.worldLeft + 0.025;
-      const slideTargetY = slideEndWin.sillY;
+      const isOnSlideSill =
+        this.state.raccoon.isRestingOnSill &&
+        this.state.raccoon.restingSillFloor === 7 &&
+        this.state.raccoon.restingSillWindowIndex === 1;
 
-      if (
-        !this.state.raccoon.isSlidingDown &&
-        !this.state.raccoon.isTumbling &&
-        Math.abs(this.state.raccoon.x - slideStartX) <= 0.038 &&
-        Math.abs(this.state.raccoon.y - slideStartY) <= 0.045 &&
-        (targetVx > 0.02 || targetVy < -0.02 || this.state.raccoon.vx > 0.02 || this.state.raccoon.vy < -0.02)
-      ) {
-        this.state.raccoon.isSlidingDown = true;
-        this.state.raccoon.slideTimer = 0;
-        this.state.raccoon.slideDuration = SLIDE_7_TO_4.DURATION;
-        this.state.raccoon.slideStartX = this.state.raccoon.x;
-        this.state.raccoon.slideStartY = this.state.raccoon.y;
-        this.state.raccoon.slideTargetX = slideTargetX;
-        this.state.raccoon.slideTargetY = slideTargetY;
-        this.state.raccoon.isRestingOnSill = false;
-        sound.playSlideDownWhoosh();
-        this.spawnFloatingText('SWOOOSH! 🛝', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#38bdf8');
-        return;
+      if (isOnSlideSill && !this.state.raccoon.isSlidingDown) {
+        this.state.interactionPrompt = 'Press DOWN to slide! 🛝';
+        hasPrompt = true;
+        const isPressingDown = this.input.isDownPressed() || targetVy < -0.15;
+        if (isPressingDown) {
+          this.state.raccoon.isSlidingDown = true;
+          this.state.raccoon.slideTimer = 0;
+          this.state.raccoon.slideDuration = SLIDE_7_TO_4.DURATION;
+          this.state.raccoon.slideStartX = this.state.raccoon.x;
+          this.state.raccoon.slideStartY = this.state.raccoon.y;
+          this.state.raccoon.slideTargetX = slideEndWin.worldLeft + 0.025;
+          this.state.raccoon.slideTargetY = slideEndWin.sillY;
+          this.state.raccoon.isRestingOnSill = false;
+          sound.playSlideDownWhoosh();
+          this.spawnFloatingText('SWOOOSH! 🛝', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#38bdf8');
+          this.checkDailyMissionEvent('slide_or_vine', 1);
+          this.state.interactionPrompt = null;
+          return;
+        }
       }
     }
+
+    // 2. Star Trek Teleport Trigger (Floor 12 Win 3 <-> Floor 16 Win 3)
+    const floor12 = this.floors.find((f) => f.floorNumber === 12);
+    const floor16 = this.floors.find((f) => f.floorNumber === 16);
+    if (floor12 && floor16 && floor12.windows[3] && floor16.windows[3]) {
+      const win12 = floor12.windows[3];
+      const win16 = floor16.windows[3];
+      const isOnF12Win3 =
+        this.state.raccoon.isRestingOnSill &&
+        this.state.raccoon.restingSillFloor === 12 &&
+        this.state.raccoon.restingSillWindowIndex === 3;
+      const isOnF16Win3 =
+        this.state.raccoon.isRestingOnSill &&
+        this.state.raccoon.restingSillFloor === 16 &&
+        this.state.raccoon.restingSillWindowIndex === 3;
+
+      if ((isOnF12Win3 || isOnF16Win3) && !this.state.raccoon.isTeleporting) {
+        const destFloor = isOnF12Win3 ? 16 : 12;
+        this.state.interactionPrompt = `Press DOWN to Teleport to Floor ${destFloor}! 🖖⚡`;
+        hasPrompt = true;
+        const isPressingDown = this.input.isDownPressed() || targetVy < -0.15;
+        if (isPressingDown) {
+          const targetWin = isOnF12Win3 ? win16 : win12;
+          this.state.raccoon.isTeleporting = true;
+          this.state.raccoon.teleportTimer = 0;
+          this.state.raccoon.teleportDuration = 0.85;
+          this.state.raccoon.teleportTargetX = (targetWin.sillLeft + targetWin.sillRight) * 0.5;
+          this.state.raccoon.teleportTargetY = targetWin.sillY;
+          this.state.raccoon.teleportTargetFloor = destFloor;
+          this.state.raccoon.teleportTargetWin = 3;
+          sound.playTeleport();
+          this.spawnFloatingText('BEAM ME UP! 🖖⚡', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#38bdf8');
+          this.state.interactionPrompt = null;
+          return;
+        }
+      }
+    }
+
+    // 3. Swinging Tarzan Vine Trigger (Floor 8: Win 0 <-> Win 4)
+    const floor8 = this.floors.find((f) => f.floorNumber === 8);
+    if (floor8 && floor8.windows[0] && floor8.windows[4] && floor8.windows[2]) {
+      const win0 = floor8.windows[0];
+      const win4 = floor8.windows[4];
+      const win2 = floor8.windows[2];
+      const isOnF8Win0 =
+        this.state.raccoon.isRestingOnSill &&
+        this.state.raccoon.restingSillFloor === 8 &&
+        this.state.raccoon.restingSillWindowIndex === 0;
+      const isOnF8Win4 =
+        this.state.raccoon.isRestingOnSill &&
+        this.state.raccoon.restingSillFloor === 8 &&
+        this.state.raccoon.restingSillWindowIndex === 4;
+
+      if ((isOnF8Win0 || isOnF8Win4) && !this.state.raccoon.isSwingingVine) {
+        const destWinIdx = isOnF8Win0 ? 4 : 0;
+        this.state.interactionPrompt = `Press DOWN to Tarzan Swing across! 🌿`;
+        hasPrompt = true;
+        const isPressingDown = this.input.isDownPressed() || targetVy < -0.15;
+        if (isPressingDown) {
+          const destWin = isOnF8Win0 ? win4 : win0;
+          this.state.raccoon.isSwingingVine = true;
+          this.state.raccoon.vineSwingTimer = 0;
+          this.state.raccoon.vineSwingDuration = 1.15;
+          this.state.raccoon.vineStartX = this.state.raccoon.x;
+          this.state.raccoon.vineStartY = this.state.raccoon.y;
+          this.state.raccoon.vineTargetX = (destWin.sillLeft + destWin.sillRight) * 0.5;
+          this.state.raccoon.vineTargetY = destWin.sillY;
+          this.state.raccoon.vineAnchorX = (win2.sillLeft + win2.sillRight) * 0.5;
+          this.state.raccoon.vineAnchorY = win2.sillY + 0.12;
+          this.state.raccoon.isRestingOnSill = false;
+          sound.playTarzanSwing();
+          this.spawnFloatingText('AHOOO-AHOO! 🌿', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#22c55e');
+          this.checkDailyMissionEvent('slide_or_vine', 1);
+          this.state.interactionPrompt = null;
+          return;
+        }
+      }
+    }
+
+    if (!hasPrompt) {
+      this.state.interactionPrompt = null;
+    }
+
     const prevX = this.state.raccoon.x;
     const prevY = this.state.raccoon.y;
     let nextX = prevX + this.state.raccoon.vx * dt;
     let nextY = prevY + this.state.raccoon.vy * dt;
+
+    // Dynamic Weather Wind: push raccoon in horizontal wind direction with increased force to make climbing more challenging
+    const isBlizzardActive = weather && (weather.isBlizzard || weather.stormPhase === 'blizzard');
+    const isThunderstormActive = weather && (weather.isThunderstorm || weather.stormPhase === 'thunderstorm');
+    if (
+      weather &&
+      !this.state.raccoon.isInTrashCan &&
+      !this.state.raccoon.isTumbling &&
+      !this.state.raccoon.isSlidingDown &&
+      !this.state.raccoon.isSwingingVine &&
+      !this.state.raccoon.isTeleporting &&
+      !this.state.raccoon.isFallingToTrashCan &&
+      !this.state.raccoon.isFallingToGameOver
+    ) {
+      const isResting = this.state.raccoon.isRestingOnSill;
+      let windPushRate = 0;
+      if (isBlizzardActive) {
+        windPushRate = isResting
+          ? GAME_CONFIG.WEATHER.BLIZZARD_SILL_WIND_FORCE
+          : GAME_CONFIG.WEATHER.BLIZZARD_WIND_FORCE;
+      } else if (isThunderstormActive) {
+        windPushRate = isResting
+          ? GAME_CONFIG.WEATHER.THUNDERSTORM_SILL_WIND_FORCE
+          : GAME_CONFIG.WEATHER.THUNDERSTORM_WIND_FORCE;
+      } else if (Math.abs(weather.wind || 0) > 0.05 && weather.type !== 'clear') {
+        windPushRate = isResting ? 0.03 : 0.06;
+      }
+
+      if (windPushRate > 0) {
+        const windPushX = (weather.wind || 0) * windPushRate * dt;
+        nextX += windPushX;
+      }
+    }
 
     // Approximate floor index to test nearby windows
     const approxFloor = Math.max(1, Math.min(SKYSCRAPER.TOTAL_FLOORS, Math.floor(prevY / SKYSCRAPER.FLOOR_HEIGHT_RATIO) + 1));
@@ -1426,6 +2083,20 @@ export class GameEngine {
         const groundLeftLimit = this.state.leftTrashCan.x - this.state.leftTrashCan.width * 0.20;
         const groundRightLimit = this.state.rightTrashCan.x + this.state.rightTrashCan.width * 0.20;
         nextX = Math.max(groundLeftLimit, Math.min(groundRightLimit, nextX));
+      } else if (
+        this.state.raccoon.restingSillFloor === SKYSCRAPER.TOTAL_FLOORS &&
+        (this.state.raccoon.restingSillWindowIndex === null || this.state.raccoon.restingSillWindowIndex === undefined)
+      ) {
+        // Locked onto the Rooftop sill / cornice surface!
+        // Crawls horizontally along the roof similar to a window sill
+        nextY = roofSillY;
+        this.state.raccoon.y = roofSillY;
+        this.state.raccoon.vy = 0;
+        landedOnSill = true;
+        const overhang = bWidth * 0.04;
+        const roofLedgeLeft = minX - overhang;
+        const roofLedgeRight = maxX + overhang;
+        nextX = Math.max(roofLedgeLeft, Math.min(roofLedgeRight, nextX));
       } else {
         // The raccoon is ALREADY resting on a window sill:
         // Stay on this exact same floor's window sill!
@@ -1489,6 +2160,25 @@ export class GameEngine {
         const groundLeftLimit = this.state.leftTrashCan.x - this.state.leftTrashCan.width * 0.20;
         const groundRightLimit = this.state.rightTrashCan.x + this.state.rightTrashCan.width * 0.20;
         nextX = Math.max(groundLeftLimit, Math.min(groundRightLimit, nextX));
+      }
+
+      // Check if reaching the Rooftop ledge (Floor 25 top of the skyscraper):
+      const overhang = bWidth * 0.04;
+      const roofLedgeLeft = minX - overhang;
+      const roofLedgeRight = maxX + overhang;
+      const isClimbingUp = (targetVy > 0 || this.state.raccoon.vy > 0);
+      const reachedRoofFromBelow = (isClimbingUp || nextY >= roofSillY - 0.015) && prevY <= roofSillY + 0.02 && nextY >= roofSillY;
+
+      if (!landedOnSill && nextX >= roofLedgeLeft && nextX <= roofLedgeRight && (reachedRoofFromBelow || nextY >= roofSillY)) {
+        nextY = roofSillY;
+        this.state.raccoon.y = roofSillY;
+        this.state.raccoon.vy = 0;
+        landedOnSill = true;
+        sound.playSillLand();
+        this.state.raccoon.isRestingOnSill = true;
+        this.state.raccoon.restingSillFloor = SKYSCRAPER.TOTAL_FLOORS;
+        this.state.raccoon.restingSillWindowIndex = null;
+        this.state.raccoon.facing = this.state.raccoon.lastSideFacing || 'right';
       }
 
       // Raccoon is climbing on the building wall (not resting on sill).
@@ -1558,29 +2248,31 @@ export class GameEngine {
       }
     }
 
-    // Fire Escape Balconies (acting like window sills for resting and energy recharge)
-    if (!landedOnSill) {
-      const feBalconyW = FIRE_ESCAPE.BALCONY_WIDTH;
-      const feBalconyX = bRight - gap * 0.60;
-      for (const fNum of FIRE_ESCAPE.FLOORS) {
-        const bFloor = this.floors.find((f) => f.floorNumber === fNum);
-        if (!bFloor) continue;
-        const bSillY = bFloor.windows[0] ? bFloor.windows[0].sillY : (fNum - 1) * SKYSCRAPER.FLOOR_HEIGHT_RATIO + 0.18;
-        if (
-          Math.abs(nextX - feBalconyX) <= feBalconyW * 0.55 &&
-          prevY >= bSillY - 0.015 &&
-          nextY <= bSillY + 0.035 &&
-          (targetVy <= 0 || this.state.raccoon.vy <= 0)
-        ) {
-          nextY = bSillY;
-          this.state.raccoon.y = bSillY;
-          this.state.raccoon.vy = 0;
-          landedOnSill = true;
-          this.state.raccoon.isRestingOnSill = true;
-          this.state.raccoon.restingSillFloor = fNum;
-          this.state.raccoon.restingSillWindowIndex = 5;
-          sound.playMetalStep();
-          break;
+    // Navigation Barriers Collision Check:
+    // Elements like window-washer scaffolding, banners, and Floor 13 full-width crossover.
+    // Blocks upward climb through barrier without causing slipping or energy loss!
+    // Note: 'drone' barriers are dynamic moving patrols handled separately via triggerDroneSlip!
+    if (this.state.navigationBarriers && this.state.navigationBarriers.length > 0) {
+      for (const barrier of this.state.navigationBarriers) {
+        if (barrier.type === 'drone') continue;
+        const bBottomY = barrier.worldY;
+        const bTopY = barrier.worldY + barrier.height;
+        const bLeftX = barrier.leftX - colRx;
+        const bRightX = barrier.rightX + colRx;
+
+        if (nextX >= bLeftX && nextX <= bRightX) {
+          // If moving upward into bottom of barrier
+          if ((targetVy > 0 || this.state.raccoon.vy > 0) && prevY <= bBottomY + 0.015 && nextY >= bBottomY) {
+            nextY = bBottomY;
+            this.state.raccoon.vy = 0;
+            break;
+          }
+          // If within the vertical span of the barrier while ascending
+          if (nextY >= bBottomY && nextY <= bTopY && (targetVy > 0 || this.state.raccoon.vy > 0)) {
+            nextY = bBottomY;
+            this.state.raccoon.vy = 0;
+            break;
+          }
         }
       }
     }
@@ -1653,37 +2345,76 @@ export class GameEngine {
       const cableY = poleY + (junctionY - poleY) * t - 0.045 * 4 * t * (1 - t);
       if (Math.abs(this.state.raccoon.y - cableY) <= ELECTRIC_CABLES.SHOCK_RADIUS) {
         sound.playElectricShock();
-        for (let s = 0; s < 14; s++) {
+        for (let s = 0; s < 18; s++) {
           this.state.electricSparks.push({
             id: Math.random(),
             x: this.state.raccoon.x,
             y: this.state.raccoon.y,
-            vx: (Math.random() - 0.5) * 0.35,
-            vy: (Math.random() - 0.5) * 0.35,
+            vx: (Math.random() - 0.5) * 0.45,
+            vy: (Math.random() - 0.5) * 0.45,
             color: Math.random() < 0.5 ? '#facc15' : '#67e8f9',
             age: 0,
-            maxAge: 0.45,
+            maxAge: 0.65,
           });
         }
         this.state.raccoon.isElectrified = true;
-        this.state.raccoon.electrifiedTimer = 0.65;
-        this.state.camera.shake = 18;
+        this.state.raccoon.electrifiedTimer = 2.4;
+        this.state.camera.shake = 24;
         this.state.raccoon.isTumbling = true;
+        this.state.raccoon.isFallingToTrashCan = false; // Electrocuted raccoon falls straight to the ground!
         this.state.raccoon.tumbleTimer = 0;
-        this.state.raccoon.tumbleTargetY = groundSurfaceY + 0.015;
+        this.state.raccoon.tumbleTargetY = groundSurfaceY;
         this.state.raccoon.isRestingOnSill = false;
+        this.state.raccoon.restingSillFloor = null;
+        this.state.raccoon.restingSillWindowIndex = null;
         this.state.raccoon.energy = Math.max(0, this.state.raccoon.energy - 15);
-        this.state.spookInvulnerabilityTimer = 2.5;
-        this.spawnFloatingText('⚡ ZZZZZT! SHOCKED! ⚡', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#facc15');
+        this.state.spookInvulnerabilityTimer = 3.5;
+        this.spawnFloatingText('⚡ ELECTROCUTED! ⚡', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#facc15');
       }
     }
 
-    // Level 7 Laundry Clothesline: Each clothing item is treated separately - only the touched item falls!
-    const f7 = this.floors.find((f) => f.floorNumber === 7);
-    if (f7 && f7.windows[2] && f7.windows[4] && this.state.laundryLine) {
-      const lineLeftX = f7.windows[2].worldLeft;
-      const lineRightX = f7.windows[4].worldRight;
-      const lineY = f7.windows[2].sillY;
+    // Dozen Pigeons Napping on Floor 2 Window Sill (Fly away if raccoon crawls on that specific window ledge)
+    const sp = this.state.atmosphere.sillPigeons;
+    if (sp && !sp.isScattered) {
+      const f2 = this.floors.find((f) => f.floorNumber === sp.floorNumber);
+      const win = f2?.windows[sp.windowIndex];
+      if (win) {
+        const sillTop = win.sillY;
+        const sillLeft = win.worldLeft;
+        const sillRight = win.worldRight;
+        const onThisSill =
+          (this.state.raccoon.isRestingOnSill &&
+            this.state.raccoon.restingSillFloor === sp.floorNumber &&
+            this.state.raccoon.restingSillWindowIndex === sp.windowIndex) ||
+          (Math.abs(this.state.raccoon.y - sillTop) < 0.045 &&
+            this.state.raccoon.x >= sillLeft - 0.02 &&
+            this.state.raccoon.x <= sillRight + 0.02);
+
+        if (onThisSill) {
+          sp.isScattered = true;
+          sp.scatterTimer = 0;
+          sound.playGeeseHonk?.(0.12);
+          this.spawnFloatingText('🐦 PIGEON SCATTER! 🐦', (sillLeft + sillRight) * 0.5, sillTop + 0.06, '#94a3b8');
+          this.checkDailyMissionEvent('pigeons_scattered', 1);
+          sp.pigeons.forEach((p, idx) => {
+            p.state = 'flying';
+            p.flyX = sillLeft + (sillRight - sillLeft) * p.offsetRatio;
+            p.flyY = sillTop + 0.01;
+            const spread = (idx - 5.5) / 5.5; // -1 to +1
+            p.flyVx = spread * 0.32 + (Math.random() - 0.5) * 0.08;
+            p.flyVy = 0.22 + Math.random() * 0.16;
+          });
+        }
+      }
+    }
+
+    // Level 9 Laundry Clothesline: Each clothing item is treated separately - only the touched item falls!
+    const laundryFloor = GAME_CONFIG.INTERACTIVE_ELEMENTS.LAUNDRY_LINE.FLOOR; // Floor 9
+    const fLaundry = this.floors.find((f) => f.floorNumber === laundryFloor);
+    if (fLaundry && fLaundry.windows[2] && fLaundry.windows[4] && this.state.laundryLine) {
+      const lineLeftX = fLaundry.windows[2].worldLeft;
+      const lineRightX = fLaundry.windows[4].worldRight;
+      const lineY = fLaundry.windows[2].sillY;
 
       const racX = this.state.raccoon.x;
       const racY = this.state.raccoon.y;
@@ -1894,6 +2625,35 @@ export class GameEngine {
       }
     }
 
+    // Drone collision check: Moving surveillance drone patrols cause slip setback when bumped
+    if (
+      this.state.navigationBarriers &&
+      this.state.navigationBarriers.length > 0 &&
+      !this.state.raccoon.isTumbling &&
+      !this.state.raccoon.isInTrashCan &&
+      this.state.spookInvulnerabilityTimer <= 0
+    ) {
+      const racX = this.state.raccoon.x;
+      const racY = this.state.raccoon.y;
+      for (const barrier of this.state.navigationBarriers) {
+        if (barrier.type !== 'drone') continue;
+        const bW = barrier.rightX - barrier.leftX;
+        const margin = 0.040;
+        const travelWidth = Math.max(0.05, bW - margin * 2);
+        const cyclePeriod = 4.2;
+        const patrolAngle = (timeSeconds * (Math.PI * 2 / cyclePeriod)) - Math.PI / 2;
+        const patrolT = (Math.sin(patrolAngle) + 1) * 0.5;
+        const droneX = barrier.leftX + margin + patrolT * travelWidth;
+        const droneY = barrier.worldY + barrier.height * 0.5;
+
+        // Collision radius check: ~0.065 world units
+        if (Math.hypot(racX - droneX, racY - droneY) < 0.065) {
+          this.triggerDroneSlip(droneX, droneY);
+          break;
+        }
+      }
+    }
+
     // Bird collision check: soaring birds & geese flocks in foreground cause slip setback
     if (
       this.state.atmosphere &&
@@ -1908,7 +2668,7 @@ export class GameEngine {
       // 1. Soaring birds (hawks, pigeons, swallows)
       if (this.state.atmosphere.soaringBirds) {
         for (const bird of this.state.atmosphere.soaringBirds) {
-          const hitRadius = (bird.type === 'hawk' ? 0.065 : 0.045) * (bird.scale / 1.8);
+          const hitRadius = (bird.type === 'hawk' ? 0.105 : 0.075) * (bird.scale / 1.8);
           const dist = Math.hypot(racX - bird.x, racY - bird.y);
           if (dist < hitRadius + racW * 0.45) {
             this.triggerBirdContact(bird.type, bird.x, bird.y);
@@ -1926,14 +2686,14 @@ export class GameEngine {
         for (const flock of this.state.atmosphere.geeseFlocks) {
           const nGeese = flock.count;
           const gooseScale = flock.scale;
-          const hitRadius = 0.038 * (gooseScale / 1.8);
+          const hitRadius = 0.065 * (gooseScale / 1.8);
           let flockHit = false;
 
           for (let i = 0; i < nGeese; i++) {
             const side = i % 2 === 0 ? 1 : -1;
             const rank = Math.floor((i + 1) / 2);
-            const gx = flock.x - flock.direction * rank * 0.045;
-            const gy = flock.y + side * rank * 0.032;
+            const gx = flock.x - flock.direction * rank * 0.070;
+            const gy = flock.y + side * rank * 0.048;
 
             if (Math.hypot(racX - gx, racY - gy) < hitRadius + racW * 0.45) {
               this.triggerBirdContact('goose', gx, gy);
@@ -1942,6 +2702,54 @@ export class GameEngine {
             }
           }
           if (flockHit) break;
+        }
+      }
+
+      // 3. Street Kite (Floors 3 to 4) - Scaled collision box proportional to doubled visual size
+      if (
+        !this.state.raccoon.isTumbling &&
+        !this.state.raccoon.isInTrashCan &&
+        this.state.atmosphere.kite
+      ) {
+        const kite = this.state.atmosphere.kite;
+        const kw = (GAME_CONFIG.INTERACTIVE_ELEMENTS.STREET_KITE.KITE_WIDTH_RATIO || 0.11);
+        const kh = (GAME_CONFIG.INTERACTIVE_ELEMENTS.STREET_KITE.KITE_HEIGHT_RATIO || 0.16);
+        const dx = Math.abs(racX - kite.kiteX);
+        const dy = Math.abs(racY - kite.kiteY);
+
+        if (dx < kw * 0.5 + racW * 0.35 && dy < kh * 0.5 + racW * 0.35) {
+          // Playful contact with the kite: causes kite to swoop upward with a wind whoosh
+          kite.targetY = Math.min(GAME_CONFIG.INTERACTIVE_ELEMENTS.STREET_KITE.MAX_WORLD_Y, kite.kiteY + 0.18);
+          kite.speedY = 0.085;
+          sound.playChimeSuccess?.();
+          this.spawnFloatingText('🪁 KITE WHOOSH!', kite.kiteX, kite.kiteY + 0.06, '#facc15');
+        }
+      }
+
+      // 4. Street-level Passing Vehicles Collision Box:
+      // Proportionally sized collision boxes based on enlarged vehicle widths and heights
+      if (
+        this.state.streetVehicles &&
+        this.state.streetVehicles.length > 0 &&
+        !this.state.raccoon.isInTrashCan &&
+        racY <= 0.08
+      ) {
+        for (const v of this.state.streetVehicles) {
+          const halfW = v.width * 0.5;
+          const halfH = v.height * 0.65;
+          const vWorldY = -0.015; // Street level world coordinates below sidewalk curb
+          if (
+            Math.abs(racX - v.x) < halfW + racW * 0.30 &&
+            Math.abs(racY - vWorldY) < halfH + 0.02
+          ) {
+            // Nudge raccoon safely back onto sidewalk curb
+            this.state.raccoon.y = Math.max(0.012, this.state.raccoon.y);
+            this.state.raccoon.vy = 0;
+            sound.playCarHorn(0.08);
+            const icon = v.type === 'bus' ? '🚎' : v.type === 'garbage_truck' ? '🗑️' : v.type === 'taxi' ? '🚖' : '🚗';
+            this.spawnFloatingText(`${icon} HONK!`, v.x, 0.06, '#facc15');
+            break;
+          }
         }
       }
     }
@@ -2061,8 +2869,6 @@ export class GameEngine {
           MAX_ENERGY,
           this.state.raccoon.energy + RECHARGE_RATE_ON_SILL * dt
         );
-      } else if (this.state.raccoon.isOnFireEscape) {
-        // Connected climbable fire escape ladder: 0% energy loss!
       } else {
         // Clinging to or climbing on building wall
         const floorNum = this.state.currentFloor;
@@ -2082,7 +2888,7 @@ export class GameEngine {
         let drainRate = baseRate;
         if (!isMoving) {
           drainRate = baseRate * STILL_DRAIN_MULTIPLIER;
-        } else if (isBoosted && !this.state.raccoon.isOnIvy) {
+        } else if (isBoosted) {
           drainRate = baseRate * BOOST_DRAIN_MULTIPLIER;
         }
 
@@ -2119,22 +2925,47 @@ export class GameEngine {
         }
       }
 
-      // If energy reaches 0%, game ends immediately
-      if (this.state.raccoon.energy <= 0) {
+      // If energy reaches 0%, trigger smooth tumble fall fading into Game Over before hitting ground
+      if (this.state.raccoon.energy <= 0 && !this.state.raccoon.isFallingToGameOver) {
         this.state.raccoon.energy = 0;
-        this.state.screen = 'GAME_OVER';
-        this.state.raccoon.vx = 0;
-        this.state.raccoon.vy = 0;
+        this.state.raccoon.isFallingToGameOver = true;
+        this.state.raccoon.gameOverFadeAlpha = 0.0;
         this.state.raccoon.isClimbing = false;
-        sound.playGameOver();
-        this.notifyState();
-        return;
+        this.state.raccoon.isRestingOnSill = false;
+        this.state.raccoon.restingSillFloor = null;
+        this.state.raccoon.restingSillWindowIndex = null;
+        this.state.raccoon.vx = 0;
+        this.state.raccoon.vy = -0.45;
+        sound.playTumbleSlideWhistle();
+        this.spawnFloatingText('EXHAUSTED! 💤', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#f43f5e');
       }
     }
 
     // Slice 3: Snacks & Spooks simulation update
     if (this.state.screen === 'PLAYING') {
       this.updateSlice3SnacksAndSpooks(dt, timeSeconds);
+    }
+
+    // Brief rooftop celebration before the Win menu dialog appears
+    if (this.roofCelebrationActive) {
+      this.roofCelebrationTimer += dt;
+      this.updateCelebrationFireworks(dt);
+
+      // Keep raccoon in crawling mode on roof with 100% full energy
+      const roofSillY = GAME_CONFIG.SKYSCRAPER.TOTAL_FLOORS * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO;
+      this.state.raccoon.isRestingOnSill = true;
+      this.state.raccoon.restingSillFloor = GAME_CONFIG.SKYSCRAPER.TOTAL_FLOORS;
+      this.state.raccoon.y = roofSillY;
+      this.state.raccoon.energy = 100;
+
+      // After brief celebration (~3.8s), transition to the Win menu!
+      if (this.roofCelebrationTimer >= 3.8 && this.state.screen === 'PLAYING') {
+        this.roofCelebrationActive = false;
+        this.state.screen = 'ROOF_CELEBRATION';
+        this.notifyState();
+      }
+    } else if (this.state.screen === 'ROOF_CELEBRATION') {
+      this.updateCelebrationFireworks(dt);
     }
 
     // Dynamic atmospheric features (scaling with altitude)
@@ -2205,6 +3036,16 @@ export class GameEngine {
         this.lastNotifiedFloor = currentFloor;
         sound.playFloorChime(currentFloor);
         this.encounterDirector.tickTurn();
+        this.checkDailyMissionEvent('floor_reached', currentFloor, { floor: currentFloor, energy: this.state.raccoon.energy });
+        if (this.state.atmosphere.weather.type === 'rain' || this.state.atmosphere.weather.type === 'snow') {
+          this.checkDailyMissionEvent('weather_climb', 1);
+        }
+
+        // Halfway Milestone: Floor 13 of 25 floors
+        if (currentFloor === 13 && !this.hasTriggeredHalfwayMilestone) {
+          this.hasTriggeredHalfwayMilestone = true;
+          this.triggerHalfwayMilestone();
+        }
       }
       this.notifyState();
     }
@@ -2226,23 +3067,81 @@ export class GameEngine {
       this.notifyState();
     }
 
-    // Check Rooftop Arrival Victory Condition (roof acts like a window sill)
+    // Check Eagle Nest arrival sound on Floor 17
+    if (currentFloor === 17 && !this.hasPlayedEagleScreech) {
+      this.hasPlayedEagleScreech = true;
+      sound.playEagleScreech();
+      this.spawnFloatingText('EAGLE SCREECH! 🦅', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#f59e0b');
+    }
+
+    // Check Rooftop Arrival Condition:
+    // The raccoon must reach the top of the building to win.
+    // The raccoon enters crawling mode when it reaches the roof similar to a window sill,
+    // and there is a brief celebration before the Win menu appears.
+    const roofSillY = SKYSCRAPER.TOTAL_FLOORS * SKYSCRAPER.FLOOR_HEIGHT_RATIO;
     if (
       currentFloor === SKYSCRAPER.TOTAL_FLOORS &&
-      this.state.raccoon.y >= (SKYSCRAPER.TOTAL_FLOORS - 1) * SKYSCRAPER.FLOOR_HEIGHT_RATIO + 0.12
+      this.state.raccoon.y >= roofSillY - 0.02 &&
+      !this.roofCelebrationActive &&
+      this.state.screen === 'PLAYING'
     ) {
+      // Enter crawling mode on the roof similar to a window sill
       this.state.raccoon.isRestingOnSill = true;
       this.state.raccoon.restingSillFloor = SKYSCRAPER.TOTAL_FLOORS;
       this.state.raccoon.restingSillWindowIndex = null;
       this.state.raccoon.facing = this.state.raccoon.lastSideFacing || 'right';
+      this.state.raccoon.y = roofSillY;
       this.state.raccoon.vx = 0;
       this.state.raccoon.vy = 0;
-      if (this.state.screen === 'PLAYING') {
-        this.state.screen = 'VICTORY';
-        sound.playRoofVictory();
-        this.notifyState();
-      }
+      this.state.raccoon.energy = 100;
+
+      // Start brief celebration
+      this.roofCelebrationActive = true;
+      this.roofCelebrationTimer = 0;
+      sound.playCelebrationFanfare();
+      this.initCelebrationFireworks();
+      this.spawnFloatingText('ROOFTOP CONQUERED! 🏆👑', this.state.raccoon.x, roofSillY + 0.08, '#facc15');
+      this.spawnFloatingText('TOP RACCOON! 🎉', this.state.raccoon.x, roofSillY + 0.15, '#22c55e');
+      this.checkDailyMissionEvent('floor_reached', SKYSCRAPER.TOTAL_FLOORS, { floor: SKYSCRAPER.TOTAL_FLOORS });
+      this.notifyState();
     }
+  }
+
+  /**
+   * Triggers large pop-up milestone celebration when raccoon reaches the halfway mark (Floor 13 of 25)
+   */
+  public triggerHalfwayMilestone() {
+    this.state.halfwayMilestoneTimer = 4.5;
+    sound.playCelebrationFanfare?.();
+
+    // Spawn celebratory colorful fireworks burst around the climbing raccoon
+    const racX = this.state.raccoon.x;
+    const racY = this.state.raccoon.y;
+    const colors = ['#facc15', '#38bdf8', '#4ade80', '#f43f5e', '#a855f7', '#fb923c'];
+    for (let i = 0; i < 20; i++) {
+      const angle = (i * Math.PI * 2) / 20 + Math.random() * 0.2;
+      const speed = 0.22 + Math.random() * 0.32;
+      this.state.celebrationFireworks.push({
+        id: Math.random(),
+        x: racX,
+        y: racY + 0.04,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        color: colors[i % colors.length],
+        size: 3 + Math.random() * 3,
+        alpha: 1,
+        age: 0,
+        maxAge: 1.5 + Math.random() * 0.6,
+      });
+    }
+
+    this.spawnFloatingText("YOU'RE HALFWAY THERE! 🌟", racX, racY + 0.08, '#fde047');
+    this.notifyState();
+  }
+
+  public dismissHalfwayMilestone() {
+    this.state.halfwayMilestoneTimer = 0;
+    this.notifyState();
   }
 
   /**
@@ -2302,6 +3201,10 @@ export class GameEngine {
    * Strictly enforces Rule 1 (Height Filter) and Rule 2 (Cooldown Check) from Master Content Bible
    */
   private spawnRandomSnack() {
+    if (this.snackCollectionCooldown > 0) return;
+    const camY = this.state.camera.y;
+    const visibleSnacks = this.state.snacks.filter((s) => Math.abs(s.y - camY) <= 0.60);
+    if (visibleSnacks.length >= 5) return;
     if (this.state.snacks.length >= GAME_CONFIG.SNACKS.MAX_ACTIVE_SNACKS) return;
 
     // Pick candidate floor near active climbing range first
@@ -2315,8 +3218,11 @@ export class GameEngine {
     if (candidateFloors.length === 0) return;
 
     const floor = candidateFloors[Math.floor(Math.random() * candidateFloors.length)];
+    const startingCanWinIndex = this.getStartingTrashCanWindowIndex();
     const availableWindows = floor.windows.filter(
-      (w) => !this.state.snacks.some((s) => s.floorNumber === floor.floorNumber && s.windowIndex === w.index)
+      (w) =>
+        !this.state.snacks.some((s) => s.floorNumber === floor.floorNumber && s.windowIndex === w.index) &&
+        !(floor.floorNumber === 1 && w.index === startingCanWinIndex)
     );
     if (availableWindows.length === 0) return;
 
@@ -2376,6 +3282,13 @@ export class GameEngine {
     const winIdx = this.state.raccoon.restingSillWindowIndex;
     if (floorNum == null || winIdx == null) return;
 
+    // Window nearest starter trash can never has any activity
+    const startingCanWinIndex = this.getStartingTrashCanWindowIndex();
+    if (floorNum === 1 && winIdx === startingCanWinIndex) return;
+
+    // Random chance (~35%) - not guaranteed every time
+    if (Math.random() > 0.35) return;
+
     const floor = this.floors.find((f) => f.floorNumber === floorNum);
     const win = floor?.windows.find((w) => w.index === winIdx);
     if (!floor || !win) return;
@@ -2417,16 +3330,15 @@ export class GameEngine {
       personVariant,
     });
 
-    // Spawn a delicious snack right on the ledge beside the raccoon
-    const snackOptions = [
-      { id: 'snack_donut', name: 'Fresh Glazed Donut', energy: 30, icon: '🍩' },
-      { id: 'snack_pizza_ledge', name: 'Hot Pizza Slice', energy: 35, icon: '🍕' },
-      { id: 'snack_cookie', name: 'Chocolate Chip Cookie', energy: 25, icon: '🍪' },
-      { id: 'snack_sandwich', name: 'Tasty Club Sandwich', energy: 30, icon: '🥪' },
-      { id: 'snack_bagel', name: 'Toasted Bagel', energy: 25, icon: '🥯' },
-      { id: 'snack_handed_snack', name: 'Warm Pretzel Snack', energy: 30, icon: '🥨' },
+    // Modest crumb / nibble (scales down with altitude to match higher challenge)
+    const crumbOptions = [
+      { id: 'snack_crumb', name: 'Cookie Crumb', energy: 8, icon: '🍪' },
+      { id: 'snack_pretzel_nibble', name: 'Pretzel Nibble', energy: 8, icon: '🥨' },
+      { id: 'snack_bagel_bite', name: 'Bagel Bite', energy: 8, icon: '🥯' },
+      { id: 'snack_donut_crumb', name: 'Donut Crumb', energy: 8, icon: '🍩' },
     ];
-    const chosen = snackOptions[Math.floor(Math.random() * snackOptions.length)];
+    const chosen = crumbOptions[Math.floor(Math.random() * crumbOptions.length)];
+    const crumbEnergy = getScaledSnackEnergy(chosen.energy, floorNum);
 
     const offset = this.state.raccoon.x < (win.sillLeft + win.sillRight) * 0.5 ? 0.032 : -0.032;
     const snackX = Math.max(win.sillLeft + 0.014, Math.min(win.sillRight - 0.014, this.state.raccoon.x + offset));
@@ -2441,7 +3353,7 @@ export class GameEngine {
       type: chosen.id,
       encounterId: chosen.id,
       name: chosen.name,
-      energyEffect: chosen.energy,
+      energyEffect: crumbEnergy,
       rarity: 'rare',
       movementEffect: 'none',
       floorNumber: floorNum,
@@ -2460,7 +3372,7 @@ export class GameEngine {
 
     sound.playChimeSuccess();
     this.spawnFloatingText(
-      `"HERE YOU GO, LITTLE FRIEND!" ${chosen.icon}✨`,
+      `"HERE'S A CRUMB!" ${chosen.icon}✨ (+${crumbEnergy}%)`,
       this.state.raccoon.x,
       this.state.raccoon.y + 0.065,
       '#34d399'
@@ -2472,8 +3384,21 @@ export class GameEngine {
    * (High rate of kids waving and residents snapping photos)
    */
   private generateRandomPersonVariant(): PersonVariant {
-    const skinTones = ['#ffd1b3', '#fcd5b8', '#dca182', '#a06e52', '#6b442a', '#442b1a'];
-    const hairColors = ['#1c1917', '#451a03', '#92400e', '#d97706', '#9ca3af', '#facc15', '#b91c1c'];
+    const { BOOK_COVER_PALETTE } = GAME_CONFIG;
+    const skinTones = [
+      BOOK_COVER_PALETTE.SKIN_FAIR, // #fde0cb
+      BOOK_COVER_PALETTE.SKIN_APRICOT, // #f7b282
+      BOOK_COVER_PALETTE.SKIN_TAN, // #c88756
+      BOOK_COVER_PALETTE.SKIN_UMBER, // #784421
+    ];
+    const hairColors = [
+      BOOK_COVER_PALETTE.HAIR_BLACK, // #18181b
+      BOOK_COVER_PALETTE.HAIR_DARK_BROWN, // #451a03
+      BOOK_COVER_PALETTE.HAIR_LIGHT_BROWN, // #b47b4c
+      BOOK_COVER_PALETTE.HAIR_BLONDE, // #facc15
+      BOOK_COVER_PALETTE.HAIR_SILVER, // #f1f5f9
+      BOOK_COVER_PALETTE.CRIMSON_RED, // #e51a24
+    ];
     const hairStyles: PersonVariant['hairStyle'][] = [
       'short',
       'curly',
@@ -2497,15 +3422,35 @@ export class GameEngine {
       'curlers',
       'none',
     ];
+
+    // Hat choices directly from book cover illustration:
+    // Red bonnet, emerald green cap, straw boater with ribbon, or black bowler
+    const hatRoll = Math.random();
+    let hatType: PersonVariant['hatType'] = 'none';
+    let hatColor: string | undefined = undefined;
+
+    if (hatRoll < 0.15) {
+      hatType = 'red_bonnet';
+      hatColor = BOOK_COVER_PALETTE.CRIMSON_RED; // #e51a24
+    } else if (hatRoll < 0.30) {
+      hatType = 'green_cap';
+      hatColor = BOOK_COVER_PALETTE.HAT_GREEN; // #16a34a
+    } else if (hatRoll < 0.42) {
+      hatType = 'straw_boater';
+      hatColor = BOOK_COVER_PALETTE.HAT_STRAW_YELLOW; // #facc15
+    } else if (hatRoll < 0.50) {
+      hatType = 'bowler';
+      hatColor = BOOK_COVER_PALETTE.INK_BLACK; // #18181b
+    }
+
     const shirtColors = [
-      '#ef4444',
-      '#3b82f6',
-      '#10b981',
-      '#f59e0b',
-      '#8b5cf6',
-      '#ec4899',
-      '#14b8a6',
-      '#64748b',
+      BOOK_COVER_PALETTE.CRIMSON_RED, // #e51a24
+      BOOK_COVER_PALETTE.SKY_CYAN, // #1ea7e1
+      BOOK_COVER_PALETTE.HAT_GREEN, // #16a34a
+      BOOK_COVER_PALETTE.BRICK_APRICOT, // #f5925d
+      BOOK_COVER_PALETTE.HAT_STRAW_YELLOW, // #facc15
+      BOOK_COVER_PALETTE.WALL_PARCHMENT, // #fdf6ed
+      BOOK_COVER_PALETTE.INK_CHARCOAL, // #27272a
     ];
 
     let accessory: PersonVariant['accessory'] = accessories[Math.floor(Math.random() * accessories.length)];
@@ -2521,6 +3466,8 @@ export class GameEngine {
       gender: genders[Math.floor(Math.random() * genders.length)],
       accessory,
       shirtColor: shirtColors[Math.floor(Math.random() * shirtColors.length)],
+      hatType,
+      hatColor,
     };
   }
 
@@ -2702,25 +3649,17 @@ export class GameEngine {
    * Physical setback when the raccoon collides with a climbing squirrel
    */
   private triggerSquirrelSlip(squirrel: { x: number; y: number }) {
+    sound.playSquirrelChatter();
     sound.playTumbleSlideWhistle();
-    this.state.camera.shake = 0.45;
+    this.state.camera.shake = 0.20;
     this.state.spookInvulnerabilityTimer = GAME_CONFIG.SPOOKS.INVULNERABILITY_DURATION;
 
     const groundSurfaceY = GAME_CONFIG.TRASH_CAN.GROUND_Y; // 0.0
-    let targetY: number;
-    let floorsDown = 1;
-
-    if (this.state.currentFloor <= 1) {
-      targetY = groundSurfaceY;
-      floorsDown = 1;
-    } else {
-      const targetFloor = Math.max(0, this.state.currentFloor - 1);
-      if (targetFloor <= 0) {
-        targetY = groundSurfaceY;
-      } else {
-        targetY = (targetFloor - 1) * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO + 0.055;
-      }
-    }
+    const floorH = GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO;
+    // Slips from 0.25 of a level to 0.85 of a level
+    const slipDistance = (0.25 + Math.random() * 0.60) * floorH;
+    const targetY = Math.max(groundSurfaceY, this.state.raccoon.y - slipDistance);
+    const floorsDown = Math.round((slipDistance / floorH) * 10) / 10;
 
     this.state.raccoon.isTumbling = true;
     this.state.raccoon.tumbleTimer = 0;
@@ -2729,14 +3668,48 @@ export class GameEngine {
     this.state.raccoon.restingSillFloor = null;
     this.state.raccoon.restingSillWindowIndex = null;
 
-    this.spawnFloatingText('SQUIRREL SLIP! 🐿️', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#f59e0b');
+    this.spawnFloatingText('PESKY SQUIRREL! 🐿️💥', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#f59e0b');
     this.showSpookToast(
       'angry_cat',
       floorsDown,
       undefined,
-      'SQUIRREL SLIP! 🐿️',
-      'Bumped into a scurrying brick squirrel! Slipped downward!',
+      'PESKY SQUIRREL! 🐿️',
+      'A mischievous brick squirrel swatted your whiskers! Slipped downward!',
       '🐿️'
+    );
+    this.state.raccoon.energy = Math.max(0, this.state.raccoon.energy - 12);
+  }
+
+  /**
+   * Physical setback when the raccoon collides with an active patrol drone
+   */
+  private triggerDroneSlip(droneX: number, droneY: number) {
+    sound.playTumbleSlideWhistle();
+    sound.playGlassSqueak();
+    this.state.camera.shake = 0.16;
+    this.state.spookInvulnerabilityTimer = GAME_CONFIG.SPOOKS.INVULNERABILITY_DURATION;
+
+    const groundSurfaceY = GAME_CONFIG.TRASH_CAN.GROUND_Y; // 0.0
+    const floorH = GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO;
+    const slipDistance = (0.20 + Math.random() * 0.55) * floorH;
+    const targetY = Math.max(groundSurfaceY, this.state.raccoon.y - slipDistance);
+    const floorsDown = Math.round((slipDistance / floorH) * 10) / 10;
+
+    this.state.raccoon.isTumbling = true;
+    this.state.raccoon.tumbleTimer = 0;
+    this.state.raccoon.tumbleTargetY = targetY;
+    this.state.raccoon.isRestingOnSill = false;
+    this.state.raccoon.restingSillFloor = null;
+    this.state.raccoon.restingSillWindowIndex = null;
+
+    this.spawnFloatingText('DRONE BUMP! 🚁', this.state.raccoon.x, this.state.raccoon.y + 0.05, '#ef4444');
+    this.showSpookToast(
+      'angry_cat',
+      floorsDown,
+      undefined,
+      'DRONE COLLISION! 🚁',
+      'Bumped into a whirring surveillance drone! Slipped downward!',
+      '🚁'
     );
     this.state.raccoon.energy = Math.max(0, this.state.raccoon.energy - 10);
   }
@@ -2775,6 +3748,23 @@ export class GameEngine {
   }
 
   /**
+   * Atmospheric contact when a Floor 3/4 dusk bat flits past the raccoon
+   */
+  private triggerBatContact(batX: number, batY: number) {
+    sound.playBatSqueak();
+    this.state.spookInvulnerabilityTimer = 1.0;
+    this.spawnFloatingText('BAT FLUTTER! 🦇', batX, batY + 0.05, '#c084fc');
+    this.showSpookToast(
+      'curious_person',
+      0, // 0 floors down - harmless atmospheric encounter
+      undefined,
+      'BAT FLUTTER! 🦇',
+      'A dusk bat flitted past with quick leathery wingbeats!',
+      '🦇'
+    );
+  }
+
+  /**
    * Returns window index on Floor 1 nearest to the starting trash can
    * Used to guarantee that no fall-causing spooks occur near the starting trash can.
    */
@@ -2804,12 +3794,11 @@ export class GameEngine {
    * Floors 21–Roof: 0.50 (50%)
    */
   public getFloorSpeedMultiplier(floorNumber: number): number {
-    const { FLOOR_SPEED_RATES } = GAME_CONFIG.RACCOON;
-    if (floorNumber <= 5) return FLOOR_SPEED_RATES.FLOORS_1_5;
-    if (floorNumber <= 10) return FLOOR_SPEED_RATES.FLOORS_6_10;
-    if (floorNumber <= 15) return FLOOR_SPEED_RATES.FLOORS_11_15;
-    if (floorNumber <= 20) return FLOOR_SPEED_RATES.FLOORS_16_20;
-    return FLOOR_SPEED_RATES.FLOORS_21_ROOF;
+    if (floorNumber <= 5) return 1.00;
+    if (floorNumber <= 10) return 0.95;
+    if (floorNumber <= 15) return 0.90;
+    if (floorNumber <= 20) return 0.85;
+    return 0.80;
   }
 
   /**
@@ -2900,12 +3889,10 @@ export class GameEngine {
    * 4. Pacing: Balance visual one-liners, snacks, and quiet climbing moments; no back-to-back negative events
    */
   private spawnRandomSpook() {
-    if (this.state.spooks.length >= GAME_CONFIG.SPOOKS.MAX_ACTIVE_BUILDING_SPOOKS) return;
-
-    // RULE 4: PACING - Occasional quiet climbing moment breathing room
-    if (Math.random() < 0.22) {
-      return;
-    }
+    if (this.spookGlobalCooldown > 0) return;
+    const isUpper = this.state.currentFloor >= 15;
+    const maxSpooks = isUpper ? 6 : GAME_CONFIG.SPOOKS.MAX_ACTIVE_BUILDING_SPOOKS;
+    if (this.state.spooks.length >= maxSpooks) return;
 
     // Pick candidate floor near the raccoon (or along skyscraper)
     let floor: FloorData | undefined;
@@ -2956,8 +3943,8 @@ export class GameEngine {
     const availableWindows = floor.windows.filter(
       (w) =>
         !this.state.spooks.some((s) => s.floorNumber === floor!.floorNumber && s.windowIndex === w.index) &&
-        // Protect window nearest starting trash can on floor 1 from fall hazards
-        !(floor!.floorNumber === 1 && w.index === startingCanWinIndex && enc.canCauseFall)
+        // Protect window nearest starting trash can on floor 1 from ANY spook activity
+        !(floor!.floorNumber === 1 && w.index === startingCanWinIndex)
     );
     if (availableWindows.length === 0) return;
 
@@ -3038,7 +4025,14 @@ export class GameEngine {
    * Slice 3: Simulation loop for snacks, spooks, particle bursts, and floating badges
    */
   private updateSlice3SnacksAndSpooks(dt: number, timeSeconds: number) {
-    // 1. Spawning timers
+    // 1. Spawning timers & cooldowns
+    if (this.snackCollectionCooldown > 0) {
+      this.snackCollectionCooldown = Math.max(0, this.snackCollectionCooldown - dt);
+    }
+    if (this.spookGlobalCooldown > 0) {
+      this.spookGlobalCooldown = Math.max(0, this.spookGlobalCooldown - dt);
+    }
+
     this.snackSpawnTimer -= dt;
     if (this.snackSpawnTimer <= 0) {
       this.snackSpawnTimer = GAME_CONFIG.SNACKS.SPAWN_INTERVAL + Math.random() * 2.0;
@@ -3047,7 +4041,10 @@ export class GameEngine {
 
     this.spookSpawnTimer -= dt;
     if (this.spookSpawnTimer <= 0) {
-      this.spookSpawnTimer = GAME_CONFIG.SPOOKS.SPAWN_INTERVAL + Math.random() * 1.5;
+      const isUpper = this.state.currentFloor >= 15;
+      this.spookSpawnTimer = isUpper
+        ? 2.8 + Math.random() * 2.2
+        : GAME_CONFIG.SPOOKS.SPAWN_INTERVAL + Math.random() * 1.5;
       this.spawnRandomSpook();
     }
 
@@ -3074,8 +4071,12 @@ export class GameEngine {
 
       if (isTouching && !snack.collected) {
         snack.collected = true;
-        // Instantly restore energy based on encounter definition or fallback
-        const recovery = snack.energyEffect ?? GAME_CONFIG.ENERGY.SNACK_RECOVERY;
+        this.checkDailyMissionEvent('snack_collected', 1);
+        // Short cooldown before next snack spawn
+        this.snackCollectionCooldown = 1.5;
+        // Instantly restore energy scaled down with altitude to make higher climbs more challenging
+        const baseRecovery = snack.energyEffect ?? GAME_CONFIG.ENERGY.SNACK_RECOVERY;
+        const recovery = getScaledSnackEnergy(baseRecovery, this.state.currentFloor);
         this.state.raccoon.energy = Math.min(
           GAME_CONFIG.ENERGY.MAX_ENERGY,
           this.state.raccoon.energy + recovery
@@ -3109,6 +4110,7 @@ export class GameEngine {
         this.lastRestingSillKey = sillKey;
         this.sillRestDuration = 0;
         this.hasSpawnedRestSnack = false;
+        this.checkDailyMissionEvent('sill_rested', 1);
       }
 
       this.sillRestDuration += dt;
@@ -3210,6 +4212,9 @@ export class GameEngine {
           !this.state.raccoon.isTumbling
         ) {
           spook.hasAdverselyAffected = true;
+          const isUpperFloor = spook.floorNumber >= 15 || this.state.currentFloor >= 15;
+          // Shorter cooldown on upper floors so more random spooks can appear
+          this.spookGlobalCooldown = isUpperFloor ? 3.0 : 7.0;
 
           const encId = spook.encounterId || '';
           const isFlashSpook =
@@ -3219,29 +4224,48 @@ export class GameEngine {
             encId === 'spook_flash_photography' ||
             spook.type === 'photo_flash';
           const causesFall = spook.canCauseFall === true || (isFlashSpook && spook.floorNumber >= 10);
+          // In upper floors, any negative spook, surprise noise, or window hazard triggers a slip!
+          const causesUpperSlip = isUpperFloor && (
+            causesFall ||
+            spook.valence === 'negative' ||
+            spook.category === 'spook' ||
+            encId.includes('spook') ||
+            encId.includes('shutter') ||
+            encId.includes('pigeon') ||
+            encId.includes('hawk') ||
+            encId.includes('vacuum') ||
+            encId.includes('cat') ||
+            encId.includes('dog') ||
+            encId.includes('drip') ||
+            encId.includes('water')
+          );
+          const movementEffect = spook.movementEffect || 'none';
           const energyEffect = spook.energyEffect ?? (spook.valence === 'negative' ? -10 : 0);
-          const movementEffect = causesFall ? 'fall' : (isFlashSpook && spook.floorNumber >= 10 ? 'drop_one_floor' : (spook.movementEffect || 'none'));
 
-          if (causesFall) {
-            // Full tumble fall hazard
-            let targetY: number;
-            let floorsDown = 1;
+          if (causesUpperSlip || causesFall || movementEffect === 'drop_one_floor' || movementEffect === 'drop_half_floor') {
             const groundSurfaceY = GAME_CONFIG.TRASH_CAN.GROUND_Y; // 0.0
+            const floorH = GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO;
 
-            if (spook.floorNumber === 1) {
-              targetY = groundSurfaceY;
-              floorsDown = 1;
+            // Slips vary from a small distance (0.15 - 0.40 floor) up to two full floors
+            let floorsDown: number;
+            const slipRoll = Math.random();
+            if (slipRoll < 0.35) {
+              // Small slip (loss of footing: 0.15 - 0.40 floor)
+              floorsDown = 0.15 + Math.random() * 0.25;
+            } else if (slipRoll < 0.70) {
+              // Moderate slip (0.50 - 1.05 floors)
+              floorsDown = 0.50 + Math.random() * 0.55;
             } else {
-              floorsDown = Math.random() < 0.65 ? 1 : 2;
-              const targetFloor = Math.max(0, this.state.currentFloor - floorsDown);
-              if (targetFloor <= 0) {
-                targetY = groundSurfaceY;
-              } else {
-                targetY = (targetFloor - 1) * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO + 0.055;
-              }
+              // Major slip (up to 2 full floors: 1.10 - 2.00 floors)
+              floorsDown = 1.10 + Math.random() * 0.90;
             }
 
-            // Trigger physical tumble
+            let targetY = Math.max(groundSurfaceY, this.state.raccoon.y - floorsDown * floorH);
+            if (targetY <= groundSurfaceY + 0.02) {
+              targetY = groundSurfaceY;
+            }
+
+            // Trigger physical tumble/slip
             this.state.raccoon.isTumbling = true;
             this.state.raccoon.tumbleTimer = 0;
             this.state.raccoon.tumbleTargetY = targetY;
@@ -3250,55 +4274,15 @@ export class GameEngine {
             this.state.raccoon.restingSillWindowIndex = null;
 
             sound.playTumbleSlideWhistle();
-            this.state.camera.shake = 0.45;
+            this.state.camera.shake = Math.min(0.55, 0.20 + floorsDown * 0.18);
             this.state.spookInvulnerabilityTimer = GAME_CONFIG.SPOOKS.INVULNERABILITY_DURATION;
 
-            this.showSpookToast(spook.type, floorsDown, spook.personVariant);
-            this.spawnFloatingText(
-              spook.floorNumber === 1 ? 'GROUND TUMBLE! 🙀' : `-${floorsDown} FL! WHOA! 🙀`,
-              racX,
-              racY + 0.05,
-              '#f43f5e'
-            );
+            const slipFloorsText = floorsDown < 0.45
+              ? 'SLIP! 🐾'
+              : `-${floorsDown < 1.0 ? floorsDown.toFixed(1) : (Math.round(floorsDown * 10) / 10).toFixed(1)} FL! 🙀`;
 
-            if (energyEffect < 0) {
-              this.state.raccoon.energy = Math.max(0, this.state.raccoon.energy + energyEffect);
-            }
-          } else if (movementEffect === 'drop_one_floor' || movementEffect === 'drop_half_floor') {
-            // Drop down half floor or one floor (does not knock completely off building)
-            const groundSurfaceY = GAME_CONFIG.TRASH_CAN.GROUND_Y;
-            let targetY: number;
-            const floorsDown = movementEffect === 'drop_half_floor' ? 0.5 : 1;
-
-            if (spook.floorNumber === 1) {
-              targetY = groundSurfaceY;
-            } else {
-              const targetFloor = Math.max(0, this.state.currentFloor - floorsDown);
-              if (targetFloor <= 0) {
-                targetY = groundSurfaceY;
-              } else {
-                targetY = (targetFloor - 1) * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO + 0.055;
-              }
-            }
-
-            this.state.raccoon.isTumbling = true;
-            this.state.raccoon.tumbleTimer = 0;
-            this.state.raccoon.tumbleTargetY = targetY;
-            this.state.raccoon.isRestingOnSill = false;
-            this.state.raccoon.restingSillFloor = null;
-            this.state.raccoon.restingSillWindowIndex = null;
-
-            sound.playTumbleSlideWhistle();
-            this.state.camera.shake = 0.35;
-            this.state.spookInvulnerabilityTimer = GAME_CONFIG.SPOOKS.INVULNERABILITY_DURATION;
-
-            this.showSpookToast(spook.type, Math.ceil(floorsDown), spook.personVariant);
-            this.spawnFloatingText(
-              `-${floorsDown} FL! 🙀`,
-              racX,
-              racY + 0.05,
-              '#f43f5e'
-            );
+            this.showSpookToast(spook.type, Math.max(1, Math.round(floorsDown)), spook.personVariant);
+            this.spawnFloatingText(slipFloorsText, racX, racY + 0.05, '#f43f5e');
 
             if (energyEffect < 0) {
               this.state.raccoon.energy = Math.max(0, this.state.raccoon.energy + energyEffect);
@@ -3359,6 +4343,9 @@ export class GameEngine {
           spook.state = 'retreating';
           spook.timer = 0.50;
           spook.maxTimer = 0.50;
+          if (!spook.hasAdverselyAffected && dist < 0.45) {
+            this.checkDailyMissionEvent('spook_dodged', 1);
+          }
         }
       }
     }
@@ -3439,6 +4426,31 @@ export class GameEngine {
   }
 
   /**
+   * Reports an event to the Daily Missions system and displays notifications if a challenge is completed
+   */
+  private checkDailyMissionEvent(eventType: MissionEventType, amount: number = 1, metadata?: { floor?: number; energy?: number }) {
+    try {
+      const newlyCompleted = reportDailyMissionEvent(eventType, amount, metadata);
+      if (newlyCompleted.length > 0) {
+        sound.playCelebrationFanfare();
+        for (const m of newlyCompleted) {
+          this.spawnFloatingText(`🎯 MISSION: ${m.title}! ⭐+${m.reward}`, this.state.raccoon.x, this.state.raccoon.y + 0.08, '#facc15');
+          this.showSpookToast(
+            'curious_person',
+            0,
+            undefined,
+            '🎯 MISSION COMPLETED!',
+            `${m.title} — Earned ${m.reward} Stars!`,
+            '⭐'
+          );
+        }
+      }
+    } catch (e) {
+      console.warn('Daily mission event error:', e);
+    }
+  }
+
+  /**
    * Slice 3: Spawns upward drifting floating text effect
    */
   private spawnFloatingText(text: string, x: number, y: number, color: string) {
@@ -3452,6 +4464,29 @@ export class GameEngine {
       lifetime: 1.85,
       scale: 0.8,
     });
+  }
+
+  /**
+   * Spawns comedic trash particles when raccoon falls into a trash can
+   */
+  private spawnTrashParticles(x: number, y: number) {
+    const trashColors = ['#94a3b8', '#64748b', '#cbd5e1', '#fef08a', '#86efac', '#e2e8f0'];
+    for (let i = 0; i < 16; i++) {
+      const angle = (i / 16) * Math.PI * 2 + (Math.random() - 0.5) * 0.4;
+      const speed = 0.09 + Math.random() * 0.16;
+      this.state.snackParticles.push({
+        id: this.nextParticleId++,
+        x,
+        y: y + 0.01,
+        vx: Math.cos(angle) * speed,
+        vy: Math.abs(Math.sin(angle)) * speed + 0.06,
+        color: trashColors[i % trashColors.length],
+        size: 0.007 + Math.random() * 0.009,
+        age: 0,
+        lifetime: 0.55 + Math.random() * 0.35,
+        shape: 'crumb',
+      });
+    }
   }
 
   /**
@@ -3522,31 +4557,70 @@ export class GameEngine {
     if (this.atmosphereSpawnTimer <= 0) {
       this.atmosphereSpawnTimer = 1.8 + Math.random() * 2.2;
 
-      // SQUIRRELS: Scurry strictly on brick mullions across building face (cannot climb window glass) on lower-to-mid floors (Floors 1 to 10)
-      if (currentFloor <= 10 && atmo.squirrels.length < (currentFloor <= 5 ? 3 : 2)) {
+      // SQUIRRELS: Scurry strictly on brick mullions across building face and crawl on window sills on lower floors (Floors 1 to 7 only, never past Floor 7)
+      const maxSquirrelY = 7.0 * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO;
+      if (currentFloor <= 7 && camera.y <= maxSquirrelY && atmo.squirrels.length < (currentFloor <= 5 ? 4 : 2)) {
         const mullions = this.getBrickMullionLanes();
-        const x = mullions[Math.floor(Math.random() * mullions.length)];
+        // Keep squirrels away from the window nearest raccoon's starting position (Columns 5 and 6 on Floor 1 & 2)
+        const allowedCols = currentFloor <= 2 ? [0, 1, 2, 3] : [0, 1, 2, 3, 4, 5, 6];
+        const colIdx = allowedCols[Math.floor(Math.random() * allowedCols.length)];
+        const x = mullions[colIdx];
         const side = x < bCenter ? 'left' : 'right';
         const startCanX = getTrashCanStartX();
-        const floor1HalfwayY = GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO * 0.5; // 0.26
-        const isNearStartCan = Math.abs(x - startCanX) < 0.08;
-        const minSpawnY = isNearStartCan ? floor1HalfwayY : 0.08;
-        const baseY = Math.max(minSpawnY, camera.y + (Math.random() - 0.3) * 0.35);
-        const targetY = Math.max(minSpawnY, baseY + (Math.random() - 0.45) * 0.4);
+        const floor1BufferY = GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO * 0.85; // Keeps safely above Floor 1 Window 5
+        const isNearStartCol = colIdx >= 4 || Math.abs(x - startCanX) < 0.08;
+        const minSpawnY = isNearStartCol ? floor1BufferY : 0.08;
+        const baseY = Math.min(maxSquirrelY - 0.04, Math.max(minSpawnY, camera.y + (Math.random() - 0.2) * 0.35));
+        // If near floor 7 ceiling, climb down; otherwise 50/50
+        const willClimbDown = baseY > maxSquirrelY - 0.12 || Math.random() < 0.5;
+        const delta = (0.22 + Math.random() * 0.32) * (willClimbDown ? -1 : 1);
+        let targetY = Math.min(maxSquirrelY, Math.max(minSpawnY, baseY + delta));
 
         atmo.squirrels.push({
           id: this.nextAtmosphereId++,
           x,
           y: baseY,
           targetY,
-          vy: 0.12 + Math.random() * 0.05,
+          vx: 0,
+          vy: 0.16 + Math.random() * 0.06, // Faster pesky scurry speed
           facing: targetY >= baseY ? 'up' : 'down',
           side,
+          state: 'climbing_wall',
+          currentColumn: colIdx,
           tailAngle: 0,
           climbPhase: Math.random(),
-          pauseTimer: Math.random() * 0.8,
-          acorn: Math.random() < 0.4,
+          pauseTimer: Math.random() * 0.5,
+          acorn: Math.random() < 0.55,
+          peskyTauntTimer: 2.0 + Math.random() * 3.0,
         });
+      }
+
+      // RANDOM BATS: Active around Floor 3 and Floor 4 swooping across building facade
+      if (
+        currentFloor >= 2 &&
+        currentFloor <= 6 &&
+        atmo.bats.length < (currentFloor === 3 || currentFloor === 4 ? 3 : 2)
+      ) {
+        if (Math.random() < 0.70) {
+          const dir = Math.random() > 0.5 ? 1 : -1;
+          const startX = dir === 1 ? camera.x - 0.95 : camera.x + 0.95;
+          const spawnFloor = Math.random() < 0.5 ? 3 : 4;
+          const baseY = (spawnFloor - 1) * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO + 0.16 + (Math.random() - 0.5) * 0.22;
+          atmo.bats.push({
+            id: this.nextAtmosphereId++,
+            x: startX,
+            y: baseY,
+            vx: dir * (0.16 + Math.random() * 0.09),
+            vy: 0,
+            baseY,
+            wingPhase: Math.random() * Math.PI * 2,
+            wingSpeed: 18 + Math.random() * 8,
+            facing: dir === 1 ? 'right' : 'left',
+            scale: 0.85 + Math.random() * 0.35,
+            swoopPhase: Math.random() * Math.PI * 2,
+            squeakCooldown: 1.0 + Math.random() * 3.0,
+          });
+        }
       }
 
       // GEESE FLOCK: Flying in V-formation across open mid-sky in foreground (Floors 4 to 20)
@@ -3571,12 +4645,12 @@ export class GameEngine {
         }
       }
 
-      // HOT AIR BALLOON: Large majestic striped balloon in foreground (Floors 16 to 22)
-      // Strictly adheres to Master Content Bible: sky_hot_air_balloon (Floors 16 to 22)
-      if (currentFloor >= 16 && currentFloor <= 22 && atmo.balloons.length < 1) {
-        if (Math.random() < 0.65) {
+      // HOT AIR BALLOON: Floats gracefully between the thunderstorm and the blizzard (Floors 11 to 13)
+      if (currentFloor >= 11 && currentFloor <= 13 && atmo.balloons.length < 1) {
+        if (Math.random() < 0.85) {
           const direction = Math.random() > 0.5 ? 1 : -1;
-          const startX = direction === 1 ? camera.x - 1.05 : camera.x + 1.05;
+          // Starting position adjusted to be slightly more centered in the horizontal direction
+          const startX = camera.x + (direction === 1 ? -0.28 : 0.28) + (Math.random() - 0.5) * 0.12;
           const startY = camera.y + 0.08 + (Math.random() - 0.25) * 0.35;
           const patterns: HotAirBalloon['colorPattern'][] = ['rainbow', 'sunset', 'ocean', 'candy'];
           atmo.balloons.push({
@@ -3584,11 +4658,28 @@ export class GameEngine {
             x: startX,
             y: startY,
             vx: direction * (0.034 + Math.random() * 0.018),
-            scale: 1.9 + Math.random() * 0.5, // Large, opaque, foreground balloon
+            scale: 1.0 + Math.random() * 0.2, // Proportionate mid-sky scale
             colorPattern: patterns[Math.floor(Math.random() * patterns.length)],
             bobblePhase: Math.random() * Math.PI * 2,
             isForeground: true,
           });
+        }
+      }
+
+      // CAPED SUPERHERO: Flies across screen at level 15 (similar in actions to geese flyover)
+      if (currentFloor >= 14 && currentFloor <= 16 && !atmo.superhero) {
+        if (Math.random() < 0.40) {
+          const fromLeft = Math.random() < 0.5;
+          const heroFloorY = 15.0 * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO - 0.22;
+          atmo.superhero = {
+            x: fromLeft ? camera.x - 1.15 : camera.x + 1.15,
+            y: heroFloorY + (Math.random() - 0.5) * 0.08,
+            vx: fromLeft ? 0.38 : -0.38,
+            scale: 1.45,
+            direction: fromLeft ? 'right' : 'left',
+            capeFlutterPhase: 0,
+          };
+          this.spawnFloatingText('🦸 CAPED HERO FLYOVER! 🦸', atmo.superhero.x, atmo.superhero.y + 0.08, '#38bdf8');
         }
       }
 
@@ -3626,18 +4717,7 @@ export class GameEngine {
       }
     }
 
-    // 2. LIGHTNING: Active in upper storm layer (Floors 16 to 25), peaking in frequency at the summit
-    if (currentFloor >= 16) {
-      this.nextLightningTimer -= dt;
-      // Frequency ramps up: Floor 16 is ~14s, Floor 25 is ~4.5s
-      const floorProgress = (currentFloor - 16) / 9; // 0.0 to 1.0
-      const strikeInterval = 14.0 - floorProgress * 9.5; // 14s down to 4.5s
-
-      if (this.nextLightningTimer <= 0) {
-        this.nextLightningTimer = strikeInterval + (Math.random() - 0.5) * 2.0;
-        this.triggerLightning(camera.x, camera.y);
-      }
-    }
+    // Lightning is strictly part of the thunderstorm (Floor 10), handled in updateWeather
 
     // Lightning Flash Decay
     if (atmo.lightningFlashAlpha > 0) {
@@ -3650,43 +4730,253 @@ export class GameEngine {
       }
     }
 
+    // Street Kite Flying from Street Level:
+    // Child moved further away from dumpster to open sidewalk (CHILD_X = 0.82)
+    // Kite begins hovering between Floor 1 and Floor 2 (MIN_WORLD_Y = 0.38)
+    // As the raccoon climbs, kite floats higher in proportion, reaching Floor 4 (MAX_WORLD_Y = 2.08)
+    if (!atmo.kite) {
+      atmo.kite = this.initStreetKite();
+    }
+    const kite = atmo.kite;
+    const { STREET_KITE } = GAME_CONFIG.INTERACTIVE_ELEMENTS;
+    kite.swayPhase = (kite.swayPhase + dt * 1.5) % (Math.PI * 2);
+
+    // Calculate raccoon climbing progress towards Floor 4 (0.0 to 1.0)
+    const floor4Height = 4.0 * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO;
+    const raccoonClimbProgress = Math.min(1.0, Math.max(0, this.state.raccoon.y / floor4Height));
+
+    // Base hover height elevates as raccoon climbs from ground/first floor up to Floor 4
+    const baseHoverY = STREET_KITE.MIN_WORLD_Y + raccoonClimbProgress * (STREET_KITE.MAX_WORLD_Y - STREET_KITE.MIN_WORLD_Y);
+    // Subtle gentle thermal hover and random atmospheric breeze bobbing
+    const thermalHover = Math.sin(timeSeconds * 1.35 + kite.swayPhase) * 0.045 + Math.cos(timeSeconds * 0.65) * 0.025;
+    kite.targetY = Math.max(STREET_KITE.MIN_WORLD_Y, Math.min(STREET_KITE.MAX_WORLD_Y, baseHoverY + thermalHover));
+
+    // Smooth gliding towards target height
+    kite.kiteY += (kite.targetY - kite.kiteY) * dt * 2.0;
+    kite.kiteY = Math.max(STREET_KITE.MIN_WORLD_Y, Math.min(STREET_KITE.MAX_WORLD_Y, kite.kiteY));
+
+    // Horizontal wind drift: kite sways gently around the base position
+    kite.childX = STREET_KITE.CHILD_X;
+    kite.kiteX = STREET_KITE.KITE_BASE_X + Math.sin(timeSeconds * 0.85) * 0.045 + Math.cos(timeSeconds * 1.9) * 0.015;
+
     // 3. Update Entities
-    // Squirrels
+    // Squirrels: cannot climb upon glass! They climb on building surfaces and crawl on window sills
     const startCanX = getTrashCanStartX();
     const floor1HalfwayY = GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO * 0.5; // 0.26
+    const mullions = this.getBrickMullionLanes();
+
     for (const sq of atmo.squirrels) {
-      // The squirrel above the trash can where the raccoon begins cannot go lower than vertical halfway point of floor 1
-      const isStartSquirrel = Math.abs(sq.x - startCanX) < 0.08;
-      const minY = isStartSquirrel ? floor1HalfwayY : 0.08;
+      const isStartCol = (sq.currentColumn !== undefined && sq.currentColumn >= 4) || Math.abs(sq.x - startCanX) < 0.08;
+      const floor1BufferY = GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO * 0.85; // Keeps safely above Floor 1 Window 5
+      const minY = isStartCol ? floor1BufferY : 0.08;
 
       if (sq.pauseTimer > 0) {
         sq.pauseTimer -= dt;
         sq.tailAngle = Math.sin(timeSeconds * 14 + sq.id) * 0.45;
-      } else {
-        const distToTarget = sq.targetY - sq.y;
-        if (Math.abs(distToTarget) < 0.015) {
-          sq.pauseTimer = 0.8 + Math.random() * 1.6;
-          // Pick new target on building (strictly above minY)
-          sq.targetY = Math.max(minY, Math.min(0.65, sq.y + (Math.random() - 0.5) * 0.35));
-          sq.facing = sq.targetY >= sq.y ? 'up' : 'down';
+        continue;
+      }
+
+      if (sq.state === 'climbing_wall' || !sq.state) {
+        // Climbing vertically along a brick wall column
+        const colIdx = Math.max(0, Math.min(6, sq.currentColumn ?? (sq.x < bCenter ? 1 : 5)));
+        sq.currentColumn = colIdx;
+        sq.x = mullions[colIdx]; // strictly on brick wall column, never on glass!
+
+        // Pesky awareness of raccoon
+        const racDistX = Math.abs(this.state.raccoon.x - sq.x);
+        const racDistY = Math.abs(this.state.raccoon.y - sq.y);
+        const isNearRaccoon = racDistX < 0.16 && racDistY < 0.40;
+
+        if (isNearRaccoon) {
+          sq.peskyTauntTimer = (sq.peskyTauntTimer || 0) - dt;
+          if (sq.peskyTauntTimer <= 0) {
+            sq.peskyTauntTimer = 3.2 + Math.random() * 2.5;
+            sound.playSquirrelChatter();
+            this.spawnFloatingText('CHITTER! 🐿️💨', sq.x, sq.y + 0.04, '#f59e0b');
+          }
+          // Pesky pursuit: actively dart toward raccoon along the brick column
+          if (Math.abs(this.state.raccoon.y - sq.y) > 0.04 && Math.random() < 0.35) {
+            sq.targetY = this.state.raccoon.y + (sq.y > this.state.raccoon.y ? -0.04 : 0.04);
+          }
+        }
+
+        const maxSquirrelY = 7.0 * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO;
+        const distToTarget = (sq.targetY ?? sq.y) - sq.y;
+        if (Math.abs(distToTarget) < 0.015 || sq.y >= maxSquirrelY) {
+          sq.pauseTimer = 0.25 + Math.random() * 0.65; // Shorter, twitchy pauses
+          // Equal 50/50 probability of climbing downward as much as upward; force down if at floor 7 top
+          const willClimbDown = sq.y >= maxSquirrelY - 0.08 || Math.random() < 0.5;
+          const verticalSpan = 0.22 + Math.random() * 0.35;
+          if (willClimbDown && sq.y > minY + 0.15) {
+            sq.targetY = Math.max(minY, sq.y - verticalSpan);
+            sq.facing = 'down';
+          } else {
+            sq.targetY = Math.min(maxSquirrelY, sq.y + verticalSpan);
+            sq.facing = 'up';
+          }
         } else {
           const moveDir = Math.sign(distToTarget);
           sq.y += moveDir * sq.vy * dt;
+          if (sq.y > maxSquirrelY) {
+            sq.y = maxSquirrelY;
+            sq.targetY = Math.max(minY, maxSquirrelY - (0.20 + Math.random() * 0.25));
+            sq.facing = 'down';
+            sq.pauseTimer = 0.3;
+          }
           if (sq.y < minY) {
             sq.y = minY;
-            sq.targetY = Math.max(minY + 0.08, sq.targetY);
-            sq.pauseTimer = 0.4;
+            sq.targetY = minY + (0.20 + Math.random() * 0.30);
+            sq.facing = 'up';
+            sq.pauseTimer = 0.3;
           }
           sq.facing = moveDir > 0 ? 'up' : 'down';
-          sq.climbPhase = (sq.climbPhase + dt * 9.5) % 1.0;
-          sq.tailAngle = Math.sin(timeSeconds * 8 + sq.id) * 0.3;
+          sq.climbPhase = (sq.climbPhase + dt * 12.0) % 1.0;
+          sq.tailAngle = Math.sin(timeSeconds * 12 + sq.id) * 0.4;
+
+          // Check if intersecting a window sill on floors 1-7 to branch onto crawling along the sill!
+          for (const floor of this.floors) {
+            if (floor.floorNumber > 7) continue;
+            if (Math.abs(floor.worldY - sq.y) > GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO * 1.5) continue;
+            for (const win of floor.windows) {
+              // Keep squirrels away from the window nearest raccoon's starting position (Floor 1 Window 5)
+              if (floor.floorNumber === 1 && win.index >= 4) continue;
+
+              if (Math.abs(sq.y - win.sillY) < 0.014 && Math.random() < 0.20) {
+                if (colIdx === win.index) {
+                  // Turn right onto window sill
+                  sq.state = 'crawling_sill';
+                  sq.sillFloor = floor.floorNumber;
+                  sq.sillWindowIndex = win.index;
+                  sq.y = win.sillY;
+                  sq.x = win.sillLeft + 0.006;
+                  sq.facing = 'right';
+                  sq.side = 'right';
+                  sq.vx = 0.08 + Math.random() * 0.03;
+                  sq.pauseTimer = 0.25;
+                  break;
+                } else if (colIdx === win.index + 1) {
+                  // Turn left onto window sill
+                  sq.state = 'crawling_sill';
+                  sq.sillFloor = floor.floorNumber;
+                  sq.sillWindowIndex = win.index;
+                  sq.y = win.sillY;
+                  sq.x = win.sillRight - 0.006;
+                  sq.facing = 'left';
+                  sq.side = 'left';
+                  sq.vx = -(0.08 + Math.random() * 0.03);
+                  sq.pauseTimer = 0.25;
+                  break;
+                }
+              }
+            }
+            if (sq.state === 'crawling_sill') break;
+          }
+        }
+      } else {
+        // Crawling horizontally on a window sill (never climbing upon glass!)
+        const floor = this.floors.find((f) => f.floorNumber === sq.sillFloor);
+        const win = floor?.windows.find((w) => w.index === sq.sillWindowIndex);
+
+        if (!win) {
+          sq.state = 'climbing_wall';
+          sq.currentColumn = 0;
+          sq.x = mullions[0];
+        } else {
+          sq.y = win.sillY; // strictly atop window sill, never on glass!
+          sq.x += sq.vx * dt;
+          sq.climbPhase = (sq.climbPhase + dt * 8.0) % 1.0;
+          sq.tailAngle = Math.sin(timeSeconds * 10 + sq.id) * 0.25;
+
+          // Reached left end of window sill (Column win.index)
+          if (sq.x <= win.sillLeft) {
+            sq.x = win.sillLeft;
+            sq.pauseTimer = 0.4 + Math.random() * 0.6;
+            if (Math.random() < 0.65) {
+              // Transition to climbing wall on column win.index!
+              sq.state = 'climbing_wall';
+              sq.currentColumn = win.index;
+              sq.x = mullions[win.index];
+              // Equal 50/50 probability of climbing downward vs upward
+              const willClimbDown = Math.random() < 0.5;
+              const verticalSpan = 0.22 + Math.random() * 0.30;
+              if (willClimbDown && sq.y > minY + 0.15) {
+                sq.facing = 'down';
+                sq.targetY = Math.max(minY, sq.y - verticalSpan);
+              } else {
+                sq.facing = 'up';
+                sq.targetY = sq.y + verticalSpan;
+              }
+            } else {
+              // Turn around and crawl back right along the sill
+              sq.facing = 'right';
+              sq.side = 'right';
+              sq.vx = Math.abs(sq.vx);
+            }
+          }
+          // Reached right end of window sill (Column win.index + 1)
+          else if (sq.x >= win.sillRight) {
+            sq.x = win.sillRight;
+            sq.pauseTimer = 0.4 + Math.random() * 0.6;
+            if (Math.random() < 0.65) {
+              // Transition to climbing wall on column win.index + 1!
+              sq.state = 'climbing_wall';
+              sq.currentColumn = win.index + 1;
+              sq.x = mullions[win.index + 1];
+              // Equal 50/50 probability of climbing downward vs upward
+              const willClimbDown = Math.random() < 0.5;
+              const verticalSpan = 0.22 + Math.random() * 0.30;
+              if (willClimbDown && sq.y > minY + 0.15) {
+                sq.facing = 'down';
+                sq.targetY = Math.max(minY, sq.y - verticalSpan);
+              } else {
+                sq.facing = 'up';
+                sq.targetY = sq.y + verticalSpan;
+              }
+            } else {
+              // Turn around and crawl back left along the sill
+              sq.facing = 'left';
+              sq.side = 'left';
+              sq.vx = -Math.abs(sq.vx);
+            }
+          }
         }
       }
+
       if (sq.y < minY) {
         sq.y = minY;
       }
     }
-    atmo.squirrels = atmo.squirrels.filter((sq) => Math.abs(sq.y - camera.y) < 1.3 && currentFloor <= 12);
+    atmo.squirrels = atmo.squirrels.filter((sq) => Math.abs(sq.y - camera.y) < 1.4 && sq.y <= 7.0 * GAME_CONFIG.SKYSCRAPER.FLOOR_HEIGHT_RATIO + 0.05 && currentFloor <= 7);
+
+    // Random Bats (Floor 3 & 4)
+    if (atmo.bats) {
+      for (const bat of atmo.bats) {
+        bat.x += bat.vx * dt;
+        bat.swoopPhase += dt * 3.8;
+        bat.y = bat.baseY + Math.sin(bat.swoopPhase) * 0.055 + Math.cos(bat.swoopPhase * 2.2) * 0.025;
+        bat.wingPhase += dt * bat.wingSpeed;
+
+        bat.squeakCooldown -= dt;
+        if (bat.squeakCooldown <= 0 && Math.abs(bat.x - camera.x) < 0.5) {
+          sound.playBatSqueak();
+          bat.squeakCooldown = 4.0 + Math.random() * 4.0;
+        }
+
+        // Harmless contact with raccoon
+        if (
+          !this.state.raccoon.isTumbling &&
+          !this.state.raccoon.isInTrashCan &&
+          this.state.spookInvulnerabilityTimer <= 0
+        ) {
+          const dx = Math.abs(this.state.raccoon.x - bat.x);
+          const dy = Math.abs(this.state.raccoon.y - bat.y);
+          if (dx < 0.045 && dy < 0.045) {
+            this.triggerBatContact(bat.x, bat.y);
+          }
+        }
+      }
+      atmo.bats = atmo.bats.filter((b) => Math.abs(b.x - camera.x) < 1.8 && Math.abs(b.y - camera.y) < 1.6);
+    }
 
     // Geese
     for (const flock of atmo.geeseFlocks) {
@@ -3701,8 +4991,8 @@ export class GameEngine {
     }
     atmo.geeseFlocks = atmo.geeseFlocks.filter((f) => Math.abs(f.x - camera.x) < 1.6);
 
-    // Hot Air Balloons (Strictly Floors 16 to 22)
-    if (currentFloor < 16 || currentFloor > 22) {
+    // Hot Air Balloons (Strictly between thunderstorm and blizzard: Floors 11 to 13)
+    if (currentFloor < 11 || currentFloor > 13) {
       atmo.balloons = [];
     } else {
       for (const b of atmo.balloons) {
@@ -3710,7 +5000,7 @@ export class GameEngine {
         b.bobblePhase += dt * 0.8;
       }
       atmo.balloons = atmo.balloons.filter(
-        (b) => Math.abs(b.x - camera.x) < 1.8 && currentFloor >= 16 && currentFloor <= 22
+        (b) => Math.abs(b.x - camera.x) < 1.8 && currentFloor >= 11 && currentFloor <= 13
       );
     }
 
@@ -3725,12 +5015,315 @@ export class GameEngine {
     // Mist Clouds
     for (const c of atmo.mistClouds) {
       c.x += c.vx * dt;
-      if (c.x > camera.x + 1.5) {
-        c.x = camera.x - 1.5;
-        c.y = camera.y + (Math.random() - 0.3) * 0.6;
-      }
     }
     atmo.mistClouds = atmo.mistClouds.filter((c) => Math.abs(c.y - camera.y) < 1.4 && currentFloor >= 9);
+
+    // Caped Superhero Movement (Level 15 flyover)
+    if (atmo.superhero) {
+      atmo.superhero.x += atmo.superhero.vx * dt;
+      atmo.superhero.capeFlutterPhase = (atmo.superhero.capeFlutterPhase + dt * 14.0) % (Math.PI * 2);
+      if (Math.abs(atmo.superhero.x - camera.x) > 1.8) {
+        atmo.superhero = null;
+      }
+    }
+
+    // Dozen Pigeons on Floor 2 Sill Movement (Flap and scatter outward when startled)
+    if (atmo.sillPigeons && atmo.sillPigeons.isScattered) {
+      atmo.sillPigeons.scatterTimer += dt;
+      for (const p of atmo.sillPigeons.pigeons) {
+        if (p.state === 'flying') {
+          p.flyX += p.flyVx * dt;
+          p.flyY += p.flyVy * dt;
+          p.wingPhase = (p.wingPhase + dt * 16.0) % (Math.PI * 2);
+        }
+      }
+    }
+
+    // Dynamic Weather Simulation (Rain streaks, Snowflakes, Slick Grip & Frost Slowdown)
+    this.updateWeather(dt, timeSeconds);
+  }
+
+  /**
+   * Weather System:
+   * Dynamic city weather changes (Rain, Snow, Clear skies)
+   * Affects climbing speed (Rain -15%, Snow -20%) and grip (occasional paw slips on slick surfaces)
+   */
+  private updateWeather(dt: number, timeSeconds: number) {
+    const atmo = this.state.atmosphere;
+    if (!atmo || !atmo.weather) return;
+    const weather = atmo.weather;
+    const camera = this.state.camera;
+    const currentFloor = this.state.currentFloor;
+
+    // Automatic weather progression by skyscraper altitude zone if in auto mode:
+    // Floors 1-8: Clear daytime ascent (sunny skies)
+    // Floor 9: Light rain begins
+    // Floor 10: Climax into thunderstorm with lightning and thunder
+    // Floor 11: Rain ends and a radiant rainbow appears in the sky
+    // Floors 12-13: Clear, sunny skies
+    // Floors 14-16: Snowstorm begins with gentle flurries
+    // Floors 17-20: Flurries turn into a windy winter blizzard
+    // Floors 21-Roof: Crisp, sunny clear summit skies
+    if (weather.mode === 'auto') {
+      let expected: import('./types').WeatherType = 'clear';
+      let phase: import('./types').StormPhase = 'none';
+
+      if (currentFloor <= 8) {
+        expected = 'clear';
+        phase = 'none';
+      } else if (currentFloor === 9) {
+        expected = 'rain';
+        phase = 'light_rain';
+      } else if (currentFloor === 10) {
+        expected = 'rain';
+        phase = 'thunderstorm';
+      } else if (currentFloor === 11) {
+        expected = 'clear';
+        phase = 'rainbow';
+      } else if (currentFloor >= 12 && currentFloor <= 13) {
+        expected = 'clear';
+        phase = 'none';
+      } else if (currentFloor === 14) {
+        expected = 'snow';
+        phase = 'snow_flurries';
+      } else if (currentFloor === 15) {
+        expected = 'snow';
+        phase = 'blizzard'; // Reduced duration: 1 floor only (floor 15)
+      } else {
+        expected = 'clear';
+        phase = 'none';
+      }
+
+      weather.stormPhase = phase;
+      weather.isThunderstorm = phase === 'thunderstorm';
+      weather.isBlizzard = phase === 'blizzard';
+
+      if (expected !== weather.targetType) {
+        this.setWeather(expected, 'auto');
+      }
+    }
+
+    // Rainbow alpha fade: arch appears prominently when rain ends (Floor 11)
+    if (weather.stormPhase === 'rainbow') {
+      weather.rainbowAlpha = Math.min(1.0, (weather.rainbowAlpha || 0) + dt * 1.5);
+    } else {
+      weather.rainbowAlpha = Math.max(0, (weather.rainbowAlpha || 0) - dt * 0.40);
+    }
+
+    // Thunderstorm Climax: periodic lightning strikes, booming thunder crashes, and screen tremors
+    if (weather.type === 'rain' && weather.stormPhase === 'thunderstorm') {
+      weather.thunderTimer = (weather.thunderTimer || 3.0) - dt;
+      if (weather.thunderTimer <= 0) {
+        weather.thunderTimer = GAME_CONFIG.WEATHER.THUNDER_INTERVAL_MIN + Math.random() * (GAME_CONFIG.WEATHER.THUNDER_INTERVAL_MAX - GAME_CONFIG.WEATHER.THUNDER_INTERVAL_MIN);
+        sound.playThunder();
+        this.triggerLightning(camera.x, camera.y);
+        this.state.camera.shake = Math.max(this.state.camera.shake, 0.24);
+        this.spawnFloatingText('⚡ THUNDER! ⛈️', this.state.raccoon.x, this.state.raccoon.y + 0.08, '#facc15');
+      }
+    }
+
+    // Smooth transition between weather types & milestone announcement badges
+    if (weather.type !== weather.targetType) {
+      weather.transitionTimer -= dt;
+      if (weather.transitionTimer <= 0) {
+        weather.type = weather.targetType;
+        weather.intensity = 1.0;
+        sound.playWeatherChange(weather.type);
+        if (weather.stormPhase === 'light_rain') {
+          sound.playRainPatter();
+          this.spawnFloatingText('🌧️ LIGHT RAIN BEGINS (-8% SPD)', this.state.raccoon.x, this.state.raccoon.y + 0.08, '#38bdf8');
+        } else if (weather.stormPhase === 'thunderstorm') {
+          sound.playThunder();
+          this.spawnFloatingText('⛈️ THUNDERSTORM CLIMAX! ⚡', this.state.raccoon.x, this.state.raccoon.y + 0.08, '#facc15');
+        } else if (weather.stormPhase === 'rainbow') {
+          sound.playRainbowSparkle();
+          this.spawnFloatingText('🌈 DOUBLE RAINBOW CELEBRATION! ✨', this.state.raccoon.x, this.state.raccoon.y + 0.08, '#f472b6');
+        } else if (weather.stormPhase === 'snow_flurries') {
+          this.spawnFloatingText('🌨️ GENTLE SNOW FLURRIES (-12% SPD)', this.state.raccoon.x, this.state.raccoon.y + 0.08, '#e0f2fe');
+        } else if (weather.stormPhase === 'blizzard') {
+          sound.playBlizzardShiver();
+          sound.playWindHowl();
+          this.spawnFloatingText('❄️ WINDY BLIZZARD! ICY GUSTS', this.state.raccoon.x, this.state.raccoon.y + 0.08, '#38bdf8');
+        } else {
+          this.spawnFloatingText('☀️ SKIES CLEARED! FULL GRIP', this.state.raccoon.x, this.state.raccoon.y + 0.08, '#fef08a');
+        }
+      }
+    }
+
+    // Dynamic wind sway (wind gusts during blizzard or thunderstorm)
+    if (weather.stormPhase === 'blizzard') {
+      // Dynamic blizzard wind with strong sustained gusts and buffeting shifts
+      weather.wind = 0.58 * Math.sin(timeSeconds * 0.7) + 0.18 * Math.sin(timeSeconds * 1.6);
+    } else {
+      const baseWind = weather.stormPhase === 'thunderstorm'
+        ? 0.40
+        : weather.type === 'snow'
+        ? 0.28
+        : weather.type === 'rain'
+        ? 0.22
+        : 0.08;
+      weather.wind = baseWind * Math.sin(timeSeconds * 0.55);
+    }
+
+    // Update ground wetness and frost level
+    if (weather.type === 'rain') {
+      weather.groundWetness = Math.min(1.0, weather.groundWetness + dt * 0.25);
+      weather.frostLevel = Math.max(0, weather.frostLevel - dt * 0.20);
+    } else if (weather.type === 'snow') {
+      weather.frostLevel = Math.min(1.0, weather.frostLevel + dt * 0.25);
+      weather.groundWetness = Math.max(0, weather.groundWetness - dt * 0.20);
+    } else {
+      weather.groundWetness = Math.max(0, weather.groundWetness - dt * 0.15);
+      weather.frostLevel = Math.max(0, weather.frostLevel - dt * 0.15);
+    }
+
+    // Particle pool management
+    const isThunderstorm = weather.stormPhase === 'thunderstorm';
+    const isBlizzard = weather.stormPhase === 'blizzard';
+    const isFlurries = weather.stormPhase === 'snow_flurries';
+    const isLightRain = weather.stormPhase === 'light_rain';
+
+    const maxDrops = weather.type === 'rain'
+      ? (isThunderstorm ? GAME_CONFIG.WEATHER.MAX_RAIN_DROPS : isLightRain ? 80 : 130)
+      : weather.type === 'snow'
+      ? (isBlizzard ? GAME_CONFIG.WEATHER.MAX_SNOW_FLAKES : isFlurries ? 65 : 95)
+      : 0;
+
+    // Spawn new drops if under cap
+    while (weather.drops.length < maxDrops) {
+      const dropX = camera.x + (Math.random() - 0.5) * 1.8;
+      const dropY = camera.y + 0.55 + Math.random() * 0.35;
+      if (weather.type === 'rain') {
+        const fallVy = isThunderstorm ? -(1.85 + Math.random() * 0.65) : -(1.30 + Math.random() * 0.40);
+        weather.drops.push({
+          x: dropX,
+          y: dropY,
+          vx: weather.wind * 0.9 + (Math.random() - 0.5) * 0.05,
+          vy: fallVy,
+          length: (isThunderstorm ? 0.055 : 0.042) + Math.random() * 0.024,
+          size: (isThunderstorm ? 2.0 : 1.5) + Math.random() * 1.0,
+          alpha: 0.65 + Math.random() * 0.35, // Pronounced glistening alpha
+        });
+      } else if (weather.type === 'snow') {
+        const fallVy = isBlizzard ? -(0.45 + Math.random() * 0.40) : -(0.18 + Math.random() * 0.15);
+        const minFlakeSize = GAME_CONFIG.WEATHER.SNOWFLAKE_BASE_SIZE_MIN;
+        const maxFlakeSize = GAME_CONFIG.WEATHER.SNOWFLAKE_BASE_SIZE_MAX;
+        const flakeSize = minFlakeSize + Math.random() * (maxFlakeSize - minFlakeSize) * (isBlizzard ? 1.15 : 0.85);
+        weather.drops.push({
+          x: dropX,
+          y: dropY,
+          vx: weather.wind * (isBlizzard ? 1.45 : 0.45) + (Math.random() - 0.5) * 0.12,
+          vy: fallVy,
+          length: 0,
+          size: flakeSize,
+          alpha: 0.80 + Math.random() * 0.20,
+          swayPhase: Math.random() * Math.PI * 2,
+        });
+      }
+    }
+
+    // Update existing drops
+    for (const drop of weather.drops) {
+      drop.x += drop.vx * dt;
+      drop.y += drop.vy * dt;
+      if (drop.swayPhase !== undefined) {
+        drop.swayPhase = (drop.swayPhase + dt * (isBlizzard ? 5.5 : 3.0)) % (Math.PI * 2);
+        drop.x += Math.sin(drop.swayPhase) * dt * (isBlizzard ? 0.12 : 0.06);
+      }
+
+      // Check rain impact on window sills or ground to trigger splash
+      if (weather.type === 'rain' && weather.splashes.length < 32 && Math.random() < 0.25) {
+        const hitFloor = this.floors.find((f) => Math.abs(drop.y - f.worldY) < 0.03);
+        if (hitFloor && drop.x >= 0.20 && drop.x <= 0.80) {
+          weather.splashes.push({
+            x: drop.x,
+            y: drop.y,
+            vx: (Math.random() - 0.5) * 0.10,
+            vy: 0.06 + Math.random() * 0.08,
+            life: 0,
+            maxLife: 0.18,
+            color: 'rgba(186, 230, 253, 0.8)',
+          });
+        }
+      }
+    }
+
+    // Filter drops that fell below viewport
+    weather.drops = weather.drops.filter(
+      (d) => d.y > camera.y - 0.60 && Math.abs(d.x - camera.x) < 1.25
+    );
+
+    // Update and filter splashes
+    for (const sp of weather.splashes) {
+      sp.life += dt;
+      sp.x += sp.vx * dt;
+      sp.y += sp.vy * dt;
+    }
+    weather.splashes = weather.splashes.filter((sp) => sp.life < sp.maxLife);
+
+    // Grip slip mechanics while climbing in wet rain or icy snow
+    const rac = this.state.raccoon;
+    if (rac.gripSlipTimer && rac.gripSlipTimer > 0) {
+      rac.gripSlipTimer -= dt;
+      if (rac.gripSlipTimer <= 0) {
+        rac.isGripSlipping = false;
+      }
+    }
+
+    const isActivelyClimbing =
+      !rac.isRestingOnSill &&
+      !rac.isInTrashCan &&
+      !rac.isTumbling &&
+      !rac.isSlidingDown &&
+      !rac.isSwingingVine &&
+      rac.isClimbing &&
+      (Math.abs(rac.vx) > 0.02 || Math.abs(rac.vy) > 0.02);
+
+    if (isActivelyClimbing && (!rac.gripSlipTimer || rac.gripSlipTimer <= 0)) {
+      if (weather.type === 'rain') {
+        const slipChance = isThunderstorm ? GAME_CONFIG.WEATHER.THUNDERSTORM_SLIP_CHANCE : GAME_CONFIG.WEATHER.RAIN_SLIP_CHANCE;
+        const slipRoll = Math.random();
+        if (slipRoll < slipChance * dt * 60) {
+          rac.isGripSlipping = true;
+          rac.gripSlipTimer = 0.32;
+          rac.y -= isThunderstorm ? 0.009 : 0.005;
+          sound.playPawSlip();
+          this.spawnTrashParticles(rac.x, rac.y);
+          this.spawnFloatingText(isThunderstorm ? 'STORM SLIP! 💧' : 'SLIP! 💧', rac.x, rac.y + 0.05, '#38bdf8');
+        }
+      } else if (weather.type === 'snow') {
+        const slipChance = isBlizzard ? GAME_CONFIG.WEATHER.BLIZZARD_SLIP_CHANCE : GAME_CONFIG.WEATHER.SNOW_SLIP_CHANCE;
+        const slipRoll = Math.random();
+        if (slipRoll < slipChance * dt * 60) {
+          rac.isGripSlipping = true;
+          rac.gripSlipTimer = 0.32;
+          rac.y -= isBlizzard ? 0.008 : 0.004;
+          sound.playPawSlip();
+          this.spawnTrashParticles(rac.x, rac.y);
+          this.spawnFloatingText(isBlizzard ? 'BLIZZARD SLIP! ❄️' : 'FROST SLIP! ❄️', rac.x, rac.y + 0.05, '#e0f2fe');
+        }
+      }
+    }
+  }
+
+  /**
+   * Toggle or set the active weather condition
+   */
+  public cycleWeather() {
+    const atmo = this.state.atmosphere;
+    if (!atmo || !atmo.weather) return;
+    const types: import('./types').WeatherType[] = ['clear', 'rain', 'snow'];
+    const nextIdx = (types.indexOf(atmo.weather.type) + 1) % types.length;
+    this.setWeather(types[nextIdx], 'manual');
+  }
+
+  public setWeather(type: import('./types').WeatherType, mode: 'auto' | 'manual' = 'manual') {
+    const atmo = this.state.atmosphere;
+    if (!atmo || !atmo.weather) return;
+    atmo.weather.targetType = type;
+    atmo.weather.transitionTimer = 0.8;
+    atmo.weather.mode = mode;
+    this.notifyState();
   }
 
   /**
@@ -3851,7 +5444,8 @@ export class GameEngine {
       const vx = direction * (baseSpeed + Math.random() * 0.08);
 
       // Start position offscreen relative to camera view
-      const startX = direction === 1 ? camera.x - 1.25 : camera.x + 1.25;
+      const spawnOffset = 1.35 + width * 0.6;
+      const startX = direction === 1 ? camera.x - spawnOffset : camera.x + spawnOffset;
 
       this.state.streetVehicles.push({
         id: this.nextVehicleId++,
@@ -3880,7 +5474,7 @@ export class GameEngine {
 
     // Filter vehicles that drove far offscreen
     this.state.streetVehicles = this.state.streetVehicles.filter(
-      (v) => Math.abs(v.x - camera.x) < 2.0
+      (v) => Math.abs(v.x - camera.x) < 2.5 + v.width
     );
   }
 

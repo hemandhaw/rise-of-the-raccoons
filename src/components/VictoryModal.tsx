@@ -23,8 +23,8 @@ export const VictoryModal: React.FC<VictoryModalProps> = ({
   const formattedTime = `${minutes > 0 ? `${minutes}m ` : ''}${seconds}s`;
 
   return (
-    <div className="absolute inset-0 z-30 flex items-center justify-center p-6 bg-slate-950/85 backdrop-blur-sm pointer-events-auto">
-      <div className="w-full max-w-xs bg-slate-900 border border-emerald-500/40 rounded-2xl p-6 shadow-2xl flex flex-col items-center text-center space-y-5">
+    <div className="absolute inset-0 z-30 flex items-center justify-center p-3 sm:p-6 bg-slate-950/85 backdrop-blur-sm pointer-events-auto">
+      <div className="w-full max-w-xs max-h-[92vh] overflow-y-auto bg-slate-900 border border-emerald-500/40 rounded-2xl p-4 sm:p-6 shadow-2xl flex flex-col items-center text-center space-y-3 sm:space-y-4">
         {/* Trophy Emblem */}
         <div className="w-14 h-14 rounded-full bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
           <Trophy className="w-7 h-7" />

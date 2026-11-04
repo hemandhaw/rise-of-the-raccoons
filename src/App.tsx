@@ -8,16 +8,27 @@ import { ArcadeFrame } from './components/ArcadeFrame';
 import { GameHUD } from './components/GameHUD';
 import { PauseModal } from './components/PauseModal';
 import { TitleScreen } from './components/TitleScreen';
+import { CharacterSelectScreen } from './components/CharacterSelectScreen';
+import { LevelSelectScreen } from './components/LevelSelectScreen';
 import { VictoryModal } from './components/VictoryModal';
 import { GameOverModal } from './components/GameOverModal';
+import { RoofCelebrationModal } from './components/RoofCelebrationModal';
 import { GameEngine } from './game/GameEngine';
 import { GameEngineState } from './game/types';
+import { DailyMissionsModal } from './components/DailyMissionsModal';
+import { BetaFeedbackModal } from './components/BetaFeedbackModal';
+import { EarlyAccessModal } from './components/EarlyAccessModal';
+import { loadDailyMissions } from './game/dailyMissions';
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<GameEngine | null>(null);
 
   const [gameState, setGameState] = useState<GameEngineState | null>(null);
+  const [showMissionsModal, setShowMissionsModal] = useState<boolean>(false);
+  const [showFeedbackModal, setShowFeedbackModal] = useState<boolean>(false);
+  const [showEarlyAccessModal, setShowEarlyAccessModal] = useState<boolean>(false);
+  const [titleMenuMode, setTitleMenuMode] = useState<'ROOT' | 'ARCADE' | 'BRAINPOWER'>('ROOT');
 
   // Initialize GameEngine
   useEffect(() => {
@@ -88,6 +99,20 @@ export default function App() {
     engineRef.current?.setJoystickVector(0, 0, false, false);
   }, []);
 
+  const handleSpeedBoost = useCallback((isBoosted: boolean) => {
+    engineRef.current?.setSpeedBoost(isBoosted);
+  }, []);
+
+  const handleStartGameWithCharacter = useCallback((charId: string) => {
+    engineRef.current?.startGameWithCharacter(charId);
+    try {
+      const missions = loadDailyMissions();
+      if (missions.autoShowOnStart) {
+        setShowMissionsModal(true);
+      }
+    } catch {}
+  }, []);
+
   return (
     <ArcadeFrame>
       {/* 
@@ -99,13 +124,50 @@ export default function App() {
         className="w-full h-full block cursor-grab active:cursor-grabbing touch-none select-none"
       />
 
-      {/* Screen: Main Menu Title Screen */}
+      {/* Screen: Main Menu Title Screen & Sub-Menus */}
       {gameState?.screen === 'MAIN_MENU' && (
         <TitleScreen
           onClimb={handleClimb}
           isMuted={gameState.isMuted}
           onToggleMute={handleToggleMute}
           bestFloor={gameState.bestFloor}
+          onOpenFeedback={() => setShowFeedbackModal(true)}
+          onOpenEarlyAccess={() => setShowEarlyAccessModal(true)}
+          selectedCharacterId={gameState.selectedCharacterId || 'mprraccoon'}
+          onSelectCharacter={(charId) => engineRef.current?.selectCharacter(charId)}
+          onOpenCharacterSelect={() => engineRef.current?.openCharacterSelect()}
+          selectedLevelId={gameState.selectedLevelId || 'st_paul'}
+          onSelectLevel={(levelId) => engineRef.current?.selectLevel(levelId)}
+          onOpenLevelSelect={() => engineRef.current?.openLevelSelect()}
+          initialMenuMode={titleMenuMode}
+          onMenuModeChange={setTitleMenuMode}
+        />
+      )}
+
+      {/* Screen: Choose Your Raccoon Character Selection Screen */}
+      {gameState?.screen === 'CHARACTER_SELECT' && (
+        <CharacterSelectScreen
+          selectedCharacterId={gameState.selectedCharacterId || 'mprraccoon'}
+          onSelectCharacter={(charId) => engineRef.current?.selectCharacter(charId)}
+          onStartGame={handleStartGameWithCharacter}
+          onBackToMenu={handleMainMenu}
+          isMuted={gameState.isMuted}
+          onToggleMute={handleToggleMute}
+        />
+      )}
+
+      {/* Screen: Choose Level Selection Screen */}
+      {gameState?.screen === 'LEVEL_SELECT' && (
+        <LevelSelectScreen
+          selectedLevelId={gameState.selectedLevelId || 'st_paul'}
+          onSelectLevel={(levelId) => engineRef.current?.selectLevel(levelId)}
+          onStartGame={(levelId) => {
+            if (levelId) engineRef.current?.selectLevel(levelId);
+            handleStartGameWithCharacter(gameState.selectedCharacterId || 'mprraccoon');
+          }}
+          onBackToMenu={handleMainMenu}
+          isMuted={gameState.isMuted}
+          onToggleMute={handleToggleMute}
         />
       )}
 
@@ -116,11 +178,21 @@ export default function App() {
           totalFloors={gameState.totalFloors}
           energy={gameState.raccoon.energy ?? 100}
           isRestingOnSill={gameState.raccoon.isRestingOnSill}
-          isSpeedBoosted={gameState.raccoon.isSpeedBoosted}
+          currentSpeedRatio={gameState.raccoon.currentSpeedRatio ?? 1.0}
+          isSpeedBoosted={gameState.raccoon.isSpeedBoosted ?? false}
+          boostCooldownTimer={gameState.raccoon.boostCooldownTimer ?? 0}
+          boostActiveTimer={gameState.raccoon.boostActiveTimer ?? 0}
           isMuted={gameState.isMuted}
           activeToast={gameState.activeToast}
+          interactionPrompt={gameState.interactionPrompt}
+          halfwayMilestoneTimer={gameState.halfwayMilestoneTimer}
+          onDismissHalfwayMilestone={() => engineRef.current?.dismissHalfwayMilestone()}
+          weather={gameState.atmosphere?.weather}
+          onCycleWeather={() => engineRef.current?.cycleWeather()}
+          onOpenMissions={() => setShowMissionsModal(true)}
           onPause={handlePause}
           onToggleMute={handleToggleMute}
+          onSpeedBoost={handleSpeedBoost}
           onJoystickMove={handleJoystickMove}
           onJoystickEnd={handleJoystickEnd}
         />
@@ -137,12 +209,44 @@ export default function App() {
           onRestart={handleRestart}
           onMainMenu={handleMainMenu}
           onToggleMute={handleToggleMute}
+          onOpenMissions={() => setShowMissionsModal(true)}
+          onOpenFeedback={() => setShowFeedbackModal(true)}
+          onOpenEarlyAccess={() => setShowEarlyAccessModal(true)}
+        />
+      )}
+
+      {/* Modal: Public Beta Feedback Screen */}
+      {showFeedbackModal && (
+        <BetaFeedbackModal onClose={() => setShowFeedbackModal(false)} />
+      )}
+
+      {/* Modal: Early Access Club Screen */}
+      {showEarlyAccessModal && (
+        <EarlyAccessModal onClose={() => setShowEarlyAccessModal(false)} />
+      )}
+
+      {/* Modal: Daily Missions Screen */}
+      {showMissionsModal && (
+        <DailyMissionsModal
+          onClose={() => setShowMissionsModal(false)}
+          onStartGame={() => setShowMissionsModal(false)}
+          isGameStart={gameState?.screen === 'PLAYING'}
         />
       )}
 
       {/* Modal: Victory Screen */}
       {gameState?.screen === 'VICTORY' && (
         <VictoryModal
+          climbTimeSeconds={gameState.climbTimeSeconds}
+          altitudeMeters={gameState.altitudeMeters}
+          onClimbAgain={handleRestart}
+          onMainMenu={handleMainMenu}
+        />
+      )}
+
+      {/* Modal: Roof Celebration Scene */}
+      {gameState?.screen === 'ROOF_CELEBRATION' && (
+        <RoofCelebrationModal
           climbTimeSeconds={gameState.climbTimeSeconds}
           altitudeMeters={gameState.altitudeMeters}
           onClimbAgain={handleRestart}

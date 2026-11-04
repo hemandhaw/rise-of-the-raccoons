@@ -2,7 +2,7 @@
  * Rise of the Raccoons! - Types & Interfaces
  */
 
-export type GameScreen = 'MAIN_MENU' | 'PLAYING' | 'PAUSED' | 'VICTORY' | 'GAME_OVER';
+export type GameScreen = 'MAIN_MENU' | 'CHARACTER_SELECT' | 'LEVEL_SELECT' | 'PLAYING' | 'PAUSED' | 'VICTORY' | 'GAME_OVER' | 'ROOF_CELEBRATION';
 
 export interface RaccoonPosition {
   x: number; // Proportional horizontal position (0.0 to 1.0)
@@ -35,17 +35,40 @@ export interface RaccoonPosition {
   tumbleTimer?: number;
   tumbleTargetY?: number;
   energy: number; // Slither.io style sprint energy (0 to 100)
-  isSlidingDown?: boolean; // Currently sliding down the diagonal slide (floor 7 to 4)
+  isSlidingDown?: boolean; // Currently sliding down the diagonal slide (floor 7 to 6)
   slideTimer?: number;
   slideDuration?: number;
   slideStartX?: number;
   slideStartY?: number;
   slideTargetX?: number;
   slideTargetY?: number;
-  isOnFireEscape?: boolean; // On fire escape ladder (zero energy loss!)
-  isOnIvy?: boolean; // On creeping ivy/grapevine (1.25x speed boost without extra energy drain)
+  isTeleporting?: boolean; // Star Trek teleport between floor 12 and 16
+  teleportTimer?: number;
+  teleportDuration?: number;
+  teleportTargetX?: number;
+  teleportTargetY?: number;
+  teleportTargetFloor?: number;
+  teleportTargetWin?: number;
+  isSwingingVine?: boolean; // Swinging Tarzan vine
+  vineSwingTimer?: number;
+  vineSwingDuration?: number;
+  vineStartX?: number;
+  vineStartY?: number;
+  vineTargetX?: number;
+  vineTargetY?: number;
+  vineAnchorX?: number;
+  vineAnchorY?: number;
+  isFallingToGameOver?: boolean; // Smooth transition fading into game over before hitting the ground
+  gameOverFadeAlpha?: number;
   isElectrified?: boolean; // Shocked by telephone cables
   electrifiedTimer?: number;
+  isFallingToTrashCan?: boolean; // Tumble landing directly into the alley trash can
+  continuousClimbDuration?: number; // Seconds spent actively climbing without resting on a window sill
+  currentSpeedRatio?: number; // 0.48 to 1.0 dynamic speed decay factor
+  boostActiveTimer?: number;
+  boostCooldownTimer?: number;
+  isGripSlipping?: boolean; // Micro-slip caused by rainy slick brick or icy frost
+  gripSlipTimer?: number;
   pawPositions: {
     frontLeft: { x: number; y: number };
     frontRight: { x: number; y: number };
@@ -178,6 +201,8 @@ export interface PersonVariant {
   gender: 'female' | 'male' | 'androgynous';
   accessory: 'glasses' | 'phone' | 'coffee' | 'pointing' | 'curlers' | 'none';
   shirtColor: string;
+  hatType?: 'red_bonnet' | 'green_cap' | 'straw_boater' | 'bowler' | 'none';
+  hatColor?: string;
 }
 
 export type SpookType = string;
@@ -204,6 +229,8 @@ export interface SpookEvent {
   x: number; // Center of window
   y: number;
   sillY: number;
+  sillLeft?: number;
+  sillRight?: number;
   state: 'warning' | 'active' | 'retreating';
   timer: number;
   maxTimer: number;
@@ -250,14 +277,37 @@ export interface ClimbingSquirrel {
   id: number;
   x: number; // World X coordinate
   y: number; // World Y coordinate
-  targetY: number;
+  targetY?: number;
+  targetX?: number;
+  vx: number;
   vy: number;
-  facing: 'up' | 'down';
+  facing: 'up' | 'down' | 'left' | 'right';
   side: 'left' | 'right';
+  state: 'climbing_wall' | 'crawling_sill';
+  sillFloor?: number;
+  sillWindowIndex?: number;
+  currentColumn?: number; // 0 to 6
   tailAngle: number;
   climbPhase: number;
   pauseTimer: number;
   acorn: boolean;
+  peskyTauntTimer?: number;
+  isChittering?: boolean;
+}
+
+export interface AtmosphericBat {
+  id: number;
+  x: number; // World X coordinate
+  y: number; // World Y coordinate (centered on Floors 3 and 4)
+  vx: number; // Horizontal velocity
+  vy: number; // Vertical swoop velocity
+  baseY: number; // Baseline altitude on Floor 3 or 4
+  wingPhase: number;
+  wingSpeed: number;
+  facing: 'left' | 'right';
+  scale: number;
+  swoopPhase: number;
+  squeakCooldown: number;
 }
 
 export interface GeeseFlock {
@@ -318,14 +368,101 @@ export interface HighMistCloud {
   isForeground: boolean;
 }
 
+export interface StreetKite {
+  childX: number;
+  childY: number;
+  kiteX: number;
+  kiteY: number;
+  targetY: number;
+  speedY: number;
+  targetTimer: number;
+  swayPhase: number;
+}
+
+export interface NappingPigeon {
+  id: number;
+  offsetRatio: number; // 0.05 to 0.95 along sill
+  facing: 1 | -1;
+  state: 'napping' | 'flying';
+  flyX: number;
+  flyY: number;
+  flyVx: number;
+  flyVy: number;
+  wingPhase: number;
+}
+
+export interface SillPigeonsGroup {
+  floorNumber: number; // Level 2
+  windowIndex: number; // specific window ledge
+  isScattered: boolean;
+  scatterTimer: number;
+  pigeons: NappingPigeon[];
+}
+
+export interface CapedSuperhero {
+  x: number;
+  y: number;
+  vx: number;
+  scale: number;
+  direction: 'left' | 'right';
+  capeFlutterPhase: number;
+}
+
+export type WeatherType = 'clear' | 'rain' | 'snow';
+export type StormPhase = 'none' | 'light_rain' | 'thunderstorm' | 'rainbow' | 'snow_flurries' | 'blizzard';
+
+export interface WeatherDrop {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  length: number;
+  size: number;
+  alpha: number;
+  swayPhase?: number;
+}
+
+export interface WeatherSplash {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+  maxLife: number;
+  color: string;
+}
+
+export interface WeatherState {
+  type: WeatherType;
+  intensity: number; // 0.0 to 1.0 transition blend
+  targetType: WeatherType;
+  transitionTimer: number;
+  drops: WeatherDrop[];
+  splashes: WeatherSplash[];
+  wind: number; // Horizontal drift factor
+  groundWetness: number;
+  frostLevel: number;
+  mode: 'auto' | 'manual';
+  stormPhase?: StormPhase;
+  rainbowAlpha?: number;
+  thunderTimer?: number;
+  isThunderstorm?: boolean;
+  isBlizzard?: boolean;
+}
+
 export interface AtmosphereState {
   squirrels: ClimbingSquirrel[];
+  bats: AtmosphericBat[];
   geeseFlocks: GeeseFlock[];
   soaringBirds: SoaringBird[];
   balloons: HotAirBalloon[];
   lightning: LightningStrike | null;
   mistClouds: HighMistCloud[];
   lightningFlashAlpha: number;
+  kite?: StreetKite;
+  sillPigeons?: SillPigeonsGroup;
+  superhero?: CapedSuperhero | null;
+  weather: WeatherState;
 }
 
 export type VehicleType = 'bus' | 'taxi' | 'sedan' | 'delivery_van' | 'sports_car' | 'garbage_truck';
@@ -375,6 +512,31 @@ export interface ElectricSpark {
   maxAge: number;
 }
 
+export interface NavigationBarrier {
+  id: string;
+  floor: number;
+  type: 'scaffolding' | 'banner_never_give_up' | 'full_width_mesh' | 'eagle_nest' | 'banner_you_can_do_it' | 'drone' | 'maintenance_platform';
+  blockedColumns: number[]; // Column indices from 0 to 6
+  worldY: number;
+  height: number;
+  leftX: number;
+  rightX: number;
+  label?: string;
+}
+
+export interface CelebrationFirework {
+  id: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  color: string;
+  size: number;
+  alpha: number;
+  age: number;
+  maxAge: number;
+}
+
 export interface GameEngineState {
   screen: GameScreen;
   raccoon: RaccoonPosition;
@@ -394,6 +556,10 @@ export interface GameEngineState {
   streetVehicles: StreetVehicle[];
   laundryLine: LaundryLineState;
   electricSparks: ElectricSpark[];
+  navigationBarriers: NavigationBarrier[];
+  celebrationFireworks: CelebrationFirework[];
+  celebrationTimer: number;
+  interactionPrompt?: string | null;
   currentFloor: number;
   highestFloorReached: number;
   bestFloor: number;
@@ -402,4 +568,7 @@ export interface GameEngineState {
   climbTimeSeconds: number;
   totalFloors: number;
   isMuted: boolean;
+  selectedCharacterId: string;
+  selectedLevelId?: string;
+  halfwayMilestoneTimer?: number;
 }

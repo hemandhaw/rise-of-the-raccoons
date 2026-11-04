@@ -207,6 +207,29 @@ class SoundSystem {
     osc.stop(now + 0.35);
   }
 
+  public playSpeedBoost() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(260, now);
+    osc.frequency.exponentialRampToValueAtTime(740, now + 0.16);
+
+    gain.gain.setValueAtTime(0.09, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 0.18);
+  }
+
   public playChimeSuccess() {
     if (this.muted) return;
     this.initCtx();
@@ -1034,9 +1057,141 @@ class SoundSystem {
   }
 
   /**
-   * Metallic step clink for climbing fire escape ladders
+   * Star Trek transporter beam dematerialize/energize sound effect
    */
-  public playMetalStep() {
+  public playTeleport() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const duration = 0.82;
+
+    // Dual shimmering sci-fi oscillators
+    [880, 1320, 1760].forEach((baseFreq, i) => {
+      if (!this.ctx) return;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc.type = i === 1 ? 'triangle' : 'sine';
+      osc.frequency.setValueAtTime(baseFreq, now);
+      // Sci-fi vibrato shimmer
+      for (let s = 0; s < 12; s++) {
+        const t = now + (s / 12) * duration;
+        const mod = Math.sin(s * 1.5) * 45;
+        osc.frequency.linearRampToValueAtTime(baseFreq + mod, t);
+      }
+
+      gain.gain.setValueAtTime(0.01, now);
+      gain.gain.linearRampToValueAtTime(0.08, now + duration * 0.4);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      osc.start(now);
+      osc.stop(now + duration);
+    });
+  }
+
+  /**
+   * Tarzan vine swing rushing air whoosh
+   */
+  public playTarzanSwing() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(220, now);
+    osc.frequency.exponentialRampToValueAtTime(440, now + 0.35);
+    osc.frequency.exponentialRampToValueAtTime(180, now + 0.95);
+
+    gain.gain.setValueAtTime(0.02, now);
+    gain.gain.linearRampToValueAtTime(0.12, now + 0.4);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.95);
+
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 0.95);
+  }
+
+  /**
+   * Majestic eagle screech cry at Floor 17
+   */
+  public playEagleScreech() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(1200, now);
+    osc.frequency.exponentialRampToValueAtTime(2600, now + 0.12);
+    osc.frequency.exponentialRampToValueAtTime(1400, now + 0.45);
+
+    gain.gain.setValueAtTime(0.01, now);
+    gain.gain.linearRampToValueAtTime(0.10, now + 0.1);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 0.5);
+  }
+
+  /**
+   * Grand celebratory rooftop fanfare with fireworks arpeggios
+   */
+  public playCelebrationFanfare() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const chords = [
+      [523.25, 659.25, 783.99], // C Major
+      [587.33, 739.99, 880.00], // D Major
+      [659.25, 830.61, 987.77], // E Major
+      [783.99, 987.77, 1174.66, 1567.98], // High G Triumph
+    ];
+
+    const now = this.ctx.currentTime;
+    chords.forEach((chord, chordIdx) => {
+      const chordTime = now + chordIdx * 0.22;
+      chord.forEach((freq) => {
+        if (!this.ctx) return;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+
+        osc.type = chordIdx === chords.length - 1 ? 'sine' : 'triangle';
+        osc.frequency.setValueAtTime(freq, chordTime);
+
+        gain.gain.setValueAtTime(0.08, chordTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, chordTime + 0.45);
+
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+
+        osc.start(chordTime);
+        osc.stop(chordTime + 0.45);
+      });
+    });
+  }
+
+  /**
+   * High-pitched playful bat echolocation chirp and flutter
+   */
+  public playBatSqueak() {
     if (this.muted) return;
     this.initCtx();
     if (!this.ctx) return;
@@ -1046,17 +1201,283 @@ class SoundSystem {
     const gain = this.ctx.createGain();
 
     osc.type = 'sine';
-    osc.frequency.setValueAtTime(1180, now);
-    osc.frequency.exponentialRampToValueAtTime(740, now + 0.05);
+    osc.frequency.setValueAtTime(2600, now);
+    osc.frequency.exponentialRampToValueAtTime(1200, now + 0.08);
 
-    gain.gain.setValueAtTime(0.09, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.07);
+    gain.gain.setValueAtTime(0.04, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
 
     osc.connect(gain);
     gain.connect(this.ctx.destination);
 
     osc.start(now);
-    osc.stop(now + 0.07);
+    osc.stop(now + 0.08);
+  }
+
+  /**
+   * Metallic clattering trash lid rattle when raccoon lands in the alley can
+   */
+  public playLidRattle() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    for (let i = 0; i < 4; i++) {
+      const t = now + i * 0.045;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(200 + Math.random() * 80, t);
+      osc.frequency.exponentialRampToValueAtTime(65, t + 0.07);
+
+      gain.gain.setValueAtTime(0.18 / (i + 1), t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.07);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      osc.start(t);
+      osc.stop(t + 0.07);
+    }
+  }
+
+  /**
+   * Quick cartoon rubbery squeak/skid when raccoon momentarily slips on slick wet or icy brick
+   */
+  public playPawSlip() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(420, now);
+    osc.frequency.linearRampToValueAtTime(210, now + 0.09);
+
+    gain.gain.setValueAtTime(0.08, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
+
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 0.09);
+  }
+
+  /**
+   * Gentle atmospheric chime when weather condition shifts
+   */
+  public playWeatherChange(type: 'clear' | 'rain' | 'snow') {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const baseFreq = type === 'clear' ? 523.25 : type === 'rain' ? 392.00 : 329.63; // C5, G4, E4
+    const notes = [baseFreq, baseFreq * 1.25, baseFreq * 1.5];
+
+    notes.forEach((freq, idx) => {
+      if (!this.ctx) return;
+      const t = now + idx * 0.08;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t);
+
+      gain.gain.setValueAtTime(0.06, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.28);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      osc.start(t);
+      osc.stop(t + 0.28);
+    });
+  }
+
+  /**
+   * Deep rolling thunder crash and reverberation for thunderstorm climax
+   */
+  public playThunder() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    // Low frequency rumble oscillator
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(65, now);
+    osc.frequency.exponentialRampToValueAtTime(28, now + 1.4);
+
+    // Initial thunderclap then rolling fade
+    gain.gain.setValueAtTime(0.18, now);
+    gain.gain.linearRampToValueAtTime(0.24, now + 0.08);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 1.5);
+
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 1.5);
+  }
+
+  /**
+   * Mischievous squirrel chatter / scurry chirp
+   */
+  public playSquirrelChatter() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    for (let i = 0; i < 4; i++) {
+      const t = now + i * 0.055;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(1600 + Math.random() * 400, t);
+      osc.frequency.linearRampToValueAtTime(800 + Math.random() * 200, t + 0.04);
+
+      gain.gain.setValueAtTime(0.08, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.045);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      osc.start(t);
+      osc.stop(t + 0.045);
+    }
+  }
+
+  /**
+   * Magical sparkling ascending glockenspiel arpeggios when vibrant rainbows appear across the sky
+   */
+  public playRainbowSparkle() {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const notes = [523.25, 659.25, 783.99, 987.77, 1046.50, 1318.51, 1567.98]; // C5, E5, G5, B5, C6, E6, G6
+
+    notes.forEach((freq, idx) => {
+      if (!this.ctx) return;
+      const t = now + idx * 0.07;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t);
+      // Soft crystalline bell attack and sparkling decay
+      gain.gain.setValueAtTime(0.001, t);
+      gain.gain.linearRampToValueAtTime(0.09, t + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0005, t + 0.42);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      osc.start(t);
+      osc.stop(t + 0.42);
+    });
+  }
+
+  /**
+   * Sweeping howling wind gust audio when strong breezes or blizzard buffets the raccoon
+   */
+  public playWindHowl(vol = 0.12) {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(140, now);
+    osc.frequency.linearRampToValueAtTime(320, now + 0.45);
+    osc.frequency.linearRampToValueAtTime(110, now + 1.2);
+
+    gain.gain.setValueAtTime(0.001, now);
+    gain.gain.linearRampToValueAtTime(vol, now + 0.35);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 1.25);
+
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 1.25);
+  }
+
+  /**
+   * Gentle rhythmic pitter-patter of raindrops hitting window glass and stone sills
+   */
+  public playRainPatter(vol = 0.07) {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    for (let i = 0; i < 5; i++) {
+      const t = now + i * 0.065 + Math.random() * 0.02;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(1100 + Math.random() * 500, t);
+      osc.frequency.exponentialRampToValueAtTime(350, t + 0.028);
+
+      gain.gain.setValueAtTime(vol * 0.8, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.032);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      osc.start(t);
+      osc.stop(t + 0.035);
+    }
+  }
+
+  /**
+   * Chilly, frosty whistling blizzard shiver with crystalline chime accents
+   */
+  public playBlizzardShiver(vol = 0.10) {
+    if (this.muted) return;
+    this.initCtx();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const freqs = [350, 700, 1050];
+    freqs.forEach((baseFreq, i) => {
+      if (!this.ctx) return;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(baseFreq, now);
+      osc.frequency.linearRampToValueAtTime(baseFreq * 1.35, now + 0.3);
+      osc.frequency.linearRampToValueAtTime(baseFreq * 0.85, now + 0.8);
+
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.linearRampToValueAtTime((vol / (i + 1)) * 0.6, now + 0.2);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.85);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      osc.start(now);
+      osc.stop(now + 0.85);
+    });
   }
 }
 
